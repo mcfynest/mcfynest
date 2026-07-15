@@ -1,0 +1,32 @@
+# Manifest — root .htaccess (cPanel / Apache)
+
+# Force HTTPS (safe to leave on — cPanel AutoSSL / Let's Encrypt covers
+# almost all Namecheap hosting). Comment out the block below if your
+# domain does not have an SSL certificate yet.
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+  RewriteCond %{HTTPS} off
+  RewriteCond %{HTTP:X-Forwarded-Proto} !https
+  RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [L,R=301]
+</IfModule>
+
+# Security headers
+<IfModule mod_headers.c>
+  Header always set X-Content-Type-Options "nosniff"
+  Header always set X-Frame-Options "SAMEORIGIN"
+  Header always set Referrer-Policy "strict-origin-when-cross-origin"
+</IfModule>
+
+# Never serve raw SQL files even if left in this folder by mistake
+<FilesMatch "\.sql$">
+  <IfModule mod_authz_core.c>
+    Require all denied
+  </IfModule>
+  <IfModule !mod_authz_core.c>
+    Order deny,allow
+    Deny from all
+  </IfModule>
+</FilesMatch>
+
+# Sensible default document
+DirectoryIndex index.php
