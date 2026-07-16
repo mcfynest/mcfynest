@@ -1,11 +1,39 @@
-# Deploying Manifest to Namecheap cPanel shared hosting
+# Deploying McFynest Logistics to Namecheap cPanel shared hosting
 
 This app is plain PHP + MySQL — no Node.js, no build step, no Composer
 dependencies. It runs on standard shared hosting. These steps assume
 Namecheap's cPanel, but apply to almost any cPanel host.
 
 You'll need: your cPanel login, and a domain (or subdomain) already
-pointed at that hosting account.
+pointed at that hosting account. Because every asset/API reference in
+this app uses a relative path (`assets/...`, `api/...`, never a leading
+`/`), it works the same whether it's uploaded to your domain's root
+(`public_html/`) or a subfolder like `public_html/dispatch/` (i.e.
+`thecubedmall.com/dispatch/`) — no code changes needed either way, just
+upload to whichever folder you want it reachable from.
+
+## Already have this live and just updating it?
+
+If you deployed this app before and are picking up a later round of
+changes (new tabs, wallet/withdrawals, expenses, reports, admin
+permissions, etc.), you don't need to repeat the whole walkthrough below
+— just:
+
+1. **Import the new migration** — in phpMyAdmin, select your existing
+   database, go to **Import**, choose `sql/migration_002_v2_features.sql`,
+   click **Go**. It only *adds* columns/tables — your existing stores,
+   products and orders are untouched. Safe to re-run if you're ever
+   unsure whether it already applied.
+2. **Re-upload the changed files** from `public/` — safest is to
+   re-upload the whole `public/` folder's contents again (File Manager
+   → Extract a fresh zip over the old one, or FTP overwrite). Your own
+   `config/config.php` won't be in this project's zip, so it's never
+   overwritten — nothing to reconfigure.
+3. If you'd previously deleted `setup.php` (as instructed below) and
+   need to add another admin login, re-upload just that one file, visit
+   it, create the login, then delete it again.
+
+That's it — steps 1–9 below are for a first-time install.
 
 ## 1. Create the MySQL database
 
@@ -32,6 +60,10 @@ pointed at that hosting account.
    first, phpMyAdmin's import uploads it directly from your browser).
 5. Click **Go**. You should see 5 tables created: `stores`,
    `admin_accounts`, `products`, `agent_products`, `orders`.
+6. Repeat the same Import steps for `sql/migration_002_v2_features.sql`
+   — this adds the wallet/withdrawals, expenses, sent-reports and
+   forgot-login tables, plus the position/permissions/bank-detail
+   columns. You should end up with 9 tables total.
 
 ## 3. Upload the application files
 
@@ -103,7 +135,7 @@ redirect block until it does, or visitors will hit a certificate error.
 
 ## 8. Test it
 
-1. Visit your domain. You should see the **MANIFEST** role picker.
+1. Visit your domain. You should see the **MCFYNEST LOGISTICS** role picker.
 2. Click **Dispatch Admin**, log in with the admin ID/password from
    step 6.
 3. Use **Create a store** to make your first store login, copy its

@@ -31,7 +31,7 @@ define('APP_SECRET', 'change-this-to-a-random-64-char-string');
 define('SETUP_KEY', 'change-this-before-first-deploy');
 
 // --- App ---------------------------------------------------------------
-define('APP_NAME', 'Manifest');
+define('APP_NAME', 'McFynest Logistics');
 define('APP_CURRENCY_SYMBOL', '₦');
 define('LOW_STOCK_THRESHOLD', 1);
 

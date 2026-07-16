@@ -85,3 +85,55 @@ function money(?float $n): string
     }
     return APP_CURRENCY_SYMBOL . number_format($n, 0);
 }
+
+/**
+ * A store's wallet balance: sum of (amount - deliveryFee - otherCharges)
+ * over its delivered orders, minus whatever is currently reserved by
+ * pending or already-paid withdrawal requests. Always computed live from
+ * source rows — never cached/stored redundantly — so it can't drift out
+ * of sync with the orders/withdrawals it's derived from.
+ */
+function store_delivered_total(PDO $pdo, int $ownerRowId): float
+{
+    $stmt = $pdo->prepare("SELECT COALESCE(SUM(amount - delivery_fee - other_charges), 0) FROM orders WHERE store_id = ? AND status = 'delivered'");
+    $stmt->execute([$ownerRowId]);
+    return (float) $stmt->fetchColumn();
+}
+
+function store_reserved_total(PDO $pdo, int $ownerRowId): float
+{
+    $stmt = $pdo->prepare("SELECT COALESCE(SUM(amount), 0) FROM withdrawals WHERE store_id = ? AND status IN ('pending','paid')");
+    $stmt->execute([$ownerRowId]);
+    return (float) $stmt->fetchColumn();
+}
+
+function store_available_balance(PDO $pdo, int $ownerRowId): float
+{
+    return max(0.0, store_delivered_total($pdo, $ownerRowId) - store_reserved_total($pdo, $ownerRowId));
+}
+
+function store_requested_withdrawal_today(PDO $pdo, int $ownerRowId): bool
+{
+    $stmt = $pdo->prepare("SELECT 1 FROM withdrawals WHERE store_id = ? AND DATE(requested_at) = CURDATE() LIMIT 1");
+    $stmt->execute([$ownerRowId]);
+    return (bool) $stmt->fetchColumn();
+}
+
+/**
+ * Appends inclusive date_from/date_to bounds (YYYY-MM-DD strings) on a
+ * DATETIME or DATE column to a WHERE clause already ending in "1=1" or
+ * a prior condition. Reads date_from/date_to straight from $_GET.
+ */
+function apply_date_range(string &$sql, array &$params, string $column, bool $isDateOnly = false): void
+{
+    $from = str_field($_GET, 'date_from');
+    $to = str_field($_GET, 'date_to');
+    if ($from !== '' && preg_match('/^\d{4}-\d{2}-\d{2}$/', $from)) {
+        $sql .= " AND {$column} >= ?";
+        $params[] = $isDateOnly ? $from : $from . ' 00:00:00';
+    }
+    if ($to !== '' && preg_match('/^\d{4}-\d{2}-\d{2}$/', $to)) {
+        $sql .= " AND {$column} <= ?";
+        $params[] = $isDateOnly ? $to : $to . ' 23:59:59';
+    }
+}
