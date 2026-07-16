@@ -3,6 +3,7 @@ declare(strict_types=1);
 define('MANIFEST_ENTRY', true);
 require_once __DIR__ . '/includes/helpers.php';
 require_once __DIR__ . '/includes/db.php';
+require_once __DIR__ . '/includes/auth.php';
 
 $configPath = __DIR__ . '/config/config.php';
 if (!file_exists($configPath)) {
@@ -18,6 +19,7 @@ $success = null;
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $key = $_POST['setup_key'] ?? '';
     $name = trim($_POST['name'] ?? '');
+    $position = trim($_POST['position'] ?? '');
     $password = $_POST['password'] ?? '';
     $adminId = trim($_POST['admin_id'] ?? '');
 
@@ -45,8 +47,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         if ($error === '') {
-            $stmt = $pdo->prepare('INSERT INTO admin_accounts (admin_id, name, password_hash) VALUES (?, ?, ?)');
-            $stmt->execute([$adminId, $name, password_hash($password, PASSWORD_BCRYPT)]);
+            // Every admin created here gets full access — setup.php is
+            // for bootstrapping trusted dispatch staff; permissions can be
+            // narrowed later from the Admin Team tab if needed.
+            $stmt = $pdo->prepare('INSERT INTO admin_accounts (admin_id, name, position, password_hash, permissions) VALUES (?, ?, ?, ?, ?)');
+            $stmt->execute([$adminId, $name, $position ?: null, password_hash($password, PASSWORD_BCRYPT), json_encode(all_permissions(ADMIN_PERM_KEYS))]);
             $success = ['admin_id' => $adminId, 'password' => $password, 'name' => $name];
         }
     }
@@ -56,7 +61,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Manifest — Admin setup</title>
+<title>McFynest Logistics — Admin setup</title>
 <link rel="stylesheet" href="assets/css/app.css">
 </head>
 <body>
@@ -83,7 +88,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         <label>Setup key</label>
         <input type="password" name="setup_key" required />
         <label>Admin's name</label>
-        <input type="text" name="name" placeholder="e.g. Dispatch Team" required />
+        <input type="text" name="name" placeholder="e.g. Tunde" required />
+        <label>Position / title (optional)</label>
+        <input type="text" name="position" placeholder="e.g. Dispatch Lead" />
         <label>Admin ID (optional — leave blank to auto-generate)</label>
         <input type="text" name="admin_id" placeholder="e.g. ADM-1001" />
         <label>Password (at least 6 characters)</label>

@@ -4,10 +4,11 @@ require_once __DIR__ . '/../includes/bootstrap_api.php';
 
 $pdo = db();
 $actor = require_admin();
+require_admin_permission($pdo, $actor, 'stores');
 $method = $_SERVER['REQUEST_METHOD'];
 
 if ($method === 'GET') {
-    $stmt = $pdo->query('SELECT s.id, s.store_id, s.store_name, s.role, s.created_at, owner.store_name AS owner_name
+    $stmt = $pdo->query('SELECT s.id, s.store_id, s.store_name, s.role, s.position, s.parent_store_id, s.created_at, owner.store_name AS owner_name
         FROM stores s LEFT JOIN stores owner ON owner.id = s.parent_store_id
         WHERE s.is_active = 1
         ORDER BY s.role = "agent", s.store_name, s.created_at DESC');

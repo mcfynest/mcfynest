@@ -1,7 +1,7 @@
 {
-  "name": "Manifest — Dispatch & Order Management",
-  "short_name": "Manifest",
-  "description": "Dispatch and order management for stores and logistics admin.",
+  "name": "McFynest Logistics — Dispatch & Order Management",
+  "short_name": "McFynest",
+  "description": "Keeping every delivery on track, together.",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",

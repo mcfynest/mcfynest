@@ -7,7 +7,7 @@ $actor = require_store_owner();
 $method = $_SERVER['REQUEST_METHOD'];
 
 if ($method === 'GET') {
-    $stmt = $pdo->prepare('SELECT id, store_id, created_at FROM stores WHERE parent_store_id = ? AND role = "agent" AND is_active = 1 ORDER BY created_at DESC');
+    $stmt = $pdo->prepare('SELECT id, store_id, position, permissions, created_at FROM stores WHERE parent_store_id = ? AND role = "agent" AND is_active = 1 ORDER BY created_at DESC');
     $stmt->execute([$actor['row_id']]);
     $agents = $stmt->fetchAll();
 
@@ -15,9 +15,12 @@ if ($method === 'GET') {
     foreach ($agents as $a) {
         $stmt2 = $pdo->prepare('SELECT p.id, p.name FROM agent_products ap JOIN products p ON p.id = ap.product_id WHERE ap.agent_store_id = ? ORDER BY p.name');
         $stmt2->execute([$a['id']]);
+        $decoded = $a['permissions'] ? json_decode($a['permissions'], true) : [];
         $out[] = [
             'id' => (int) $a['id'],
             'store_id' => $a['store_id'],
+            'position' => $a['position'] ?: null,
+            'permissions' => is_array($decoded) ? $decoded : [],
             'products' => $stmt2->fetchAll(),
         ];
     }
@@ -27,13 +30,16 @@ if ($method === 'GET') {
 if ($method === 'POST') {
     $body = read_json_body();
     $password = (string) ($body['password'] ?? '');
+    $position = str_field($body, 'position');
     $productIds = array_map('intval', $body['product_ids'] ?? []);
+    $checkedPerms = array_map('strval', $body['permissions'] ?? STORE_TEAM_PERM_KEYS);
+    $permissions = build_permissions($checkedPerms, STORE_TEAM_PERM_KEYS);
 
     if ($password === '' || strlen($password) < 6) {
         json_error('Set a password of at least 6 characters.', 400);
     }
 
-    // Only allow assigning products that actually belong to this owner's store.
+    // Only allow tagging products that actually belong to this owner's store.
     $validProductIds = [];
     if (!empty($productIds)) {
         $placeholders = implode(',', array_fill(0, count($productIds), '?'));
@@ -50,8 +56,8 @@ if ($method === 'POST') {
 
     $pdo->beginTransaction();
     try {
-        $stmt = $pdo->prepare('INSERT INTO stores (store_id, store_name, password_hash, role, parent_store_id) VALUES (?, ?, ?, "agent", ?)');
-        $stmt->execute([$storeId, $actor['store_name'], password_hash($password, PASSWORD_BCRYPT), $actor['row_id']]);
+        $stmt = $pdo->prepare('INSERT INTO stores (store_id, store_name, password_hash, role, parent_store_id, position, permissions) VALUES (?, ?, ?, "agent", ?, ?, ?)');
+        $stmt->execute([$storeId, $actor['store_name'], password_hash($password, PASSWORD_BCRYPT), $actor['row_id'], $position ?: null, json_encode($permissions)]);
         $agentRowId = (int) $pdo->lastInsertId();
 
         if (!empty($validProductIds)) {
@@ -80,6 +86,16 @@ if ($method === 'PATCH') {
     }
 
     $response = ['id' => $agentId];
+
+    if (array_key_exists('position', $body)) {
+        $pdo->prepare('UPDATE stores SET position = ? WHERE id = ?')->execute([str_field($body, 'position') ?: null, $agentId]);
+    }
+
+    if (array_key_exists('permissions', $body)) {
+        $checkedPerms = array_map('strval', $body['permissions'] ?? []);
+        $permissions = build_permissions($checkedPerms, STORE_TEAM_PERM_KEYS);
+        $pdo->prepare('UPDATE stores SET permissions = ? WHERE id = ?')->execute([json_encode($permissions), $agentId]);
+    }
 
     if (array_key_exists('product_ids', $body)) {
         $productIds = array_map('intval', $body['product_ids'] ?? []);
