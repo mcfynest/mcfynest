@@ -13,7 +13,7 @@ const LOCKOUT_MINUTES = 10;
 // lists is ignored when building a permissions object — never trust
 // arbitrary JSON keys straight from the request body.
 const STORE_TEAM_PERM_KEYS = ['order', 'inventory', 'history'];
-const ADMIN_PERM_KEYS = ['orders', 'inventory', 'stores', 'team', 'withdrawals', 'expenses'];
+const ADMIN_PERM_KEYS = ['orders', 'inventory', 'stores', 'team', 'withdrawals', 'expenses', 'trash'];
 
 /** Builds a clean {key: bool} permissions object from a client-supplied list of checked keys. */
 function build_permissions(array $checkedKeys, array $validKeys): array

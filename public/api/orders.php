@@ -6,9 +6,11 @@ $pdo = db();
 $actor = require_actor();
 $method = $_SERVER['REQUEST_METHOD'];
 
+const ORDER_STATUSES = ['pending', 'scheduled', 'shipped', 'transit', 'delivered', 'remitted', 'notpicking', 'issue', 'returned', 'cancelled'];
+const RESTOCK_ELIGIBLE_STATUSES = ['cancelled', 'issue', 'returned'];
+
 function order_row_for_client(array $o): array
 {
-    $delivery = (float) $o['delivery_fee'] + (float) $o['other_charges'];
     return [
         'id' => $o['order_code'],
         'store' => $o['store_name'],
@@ -22,6 +24,7 @@ function order_row_for_client(array $o): array
         'notes' => $o['instructions'],
         'amount' => (float) $o['amount'],
         'status' => $o['status'],
+        'deleted' => (bool) $o['deleted'],
         'rider' => $o['rider'],
         'remark' => $o['dispatch_note'],
         'deliveryFee' => (float) $o['delivery_fee'],
@@ -36,14 +39,20 @@ function order_row_for_client(array $o): array
 }
 
 if ($method === 'GET') {
+    $wantTrash = str_field($_GET, 'trash') === '1';
+
     if ($actor['type'] === 'admin') {
-        require_admin_permission($pdo, $actor, 'orders');
+        if ($wantTrash) {
+            require_admin_permission($pdo, $actor, 'trash');
+        } else {
+            require_admin_permission($pdo, $actor, 'orders');
+        }
         $storeFilter = str_field($_GET, 'store_id');
         $statusFilter = str_field($_GET, 'status');
         $q = str_field($_GET, 'q');
 
         $sql = 'SELECT o.*, s.store_name, s.store_id AS store_login_id
-                FROM orders o JOIN stores s ON s.id = o.store_id WHERE 1=1';
+                FROM orders o JOIN stores s ON s.id = o.store_id WHERE o.deleted = ' . ($wantTrash ? '1' : '0');
         $params = [];
 
         if ($storeFilter !== '' && $storeFilter !== 'all') {
@@ -61,8 +70,8 @@ if ($method === 'GET') {
             $params[] = $like;
             $params[] = $like;
         }
-        apply_date_range($sql, $params, 'o.created_at');
-        $sql .= ' ORDER BY o.created_at DESC LIMIT 1000';
+        apply_date_range($sql, $params, $wantTrash ? 'o.updated_at' : 'o.created_at');
+        $sql .= ' ORDER BY ' . ($wantTrash ? 'o.updated_at DESC' : 'o.created_at DESC') . ' LIMIT 1000';
 
         $stmt = $pdo->prepare($sql);
         $stmt->execute($params);
@@ -70,10 +79,11 @@ if ($method === 'GET') {
     }
 
     // Store actor (owner or team member) — both see every order for
-    // their store, gated only by the "history" permission.
+    // their store, gated only by the "history" permission. Stores never
+    // see their own trash query (trash is admin-only).
     require_store_permission($pdo, $actor, 'history');
     $sql = 'SELECT o.*, s.store_name FROM orders o JOIN stores s ON s.id = o.store_id
-            WHERE o.store_id = ?';
+            WHERE o.store_id = ? AND o.deleted = 0';
     $params = [$actor['owner_row_id']];
     apply_date_range($sql, $params, 'o.created_at');
     $sql .= ' ORDER BY o.created_at DESC LIMIT 1000';
@@ -105,7 +115,7 @@ if ($method === 'POST') {
 
     $pdo->beginTransaction();
     try {
-        $stmt = $pdo->prepare('SELECT id, name, qty FROM products WHERE id = ? AND store_id = ? FOR UPDATE');
+        $stmt = $pdo->prepare('SELECT id, name, qty FROM products WHERE id = ? AND store_id = ? AND deleted = 0 FOR UPDATE');
         $stmt->execute([$productId, $actor['owner_row_id']]);
         $product = $stmt->fetch();
 
@@ -141,23 +151,103 @@ if ($method === 'POST') {
 }
 
 if ($method === 'PATCH') {
-    require_admin();
-    require_admin_permission($pdo, $actor, 'orders');
     $body = read_json_body();
-    $orderCode = str_field($body, 'id');
-    if ($orderCode === '') {
-        json_error('Missing order id.', 400);
+    $action = str_field($body, 'action');
+
+    // Move to Trash (soft-delete) — a store can trash its own orders,
+    // an admin can trash any order. Restoring/permanent-delete stay
+    // admin-only (gated on 'trash') below.
+    if ($action === 'trash' || $action === 'delete') {
+        $orderCode = str_field($body, 'id');
+        if ($orderCode === '') {
+            json_error('Missing order id.', 400);
+        }
+        if ($actor['type'] === 'store') {
+            require_store_permission($pdo, $actor, 'order');
+            $stmt = $pdo->prepare('UPDATE orders SET deleted = 1, updated_at = CURRENT_TIMESTAMP WHERE order_code = ? AND store_id = ?');
+            $stmt->execute([$orderCode, $actor['owner_row_id']]);
+        } else {
+            require_admin_permission($pdo, $actor, 'orders');
+            $stmt = $pdo->prepare('UPDATE orders SET deleted = 1, updated_at = CURRENT_TIMESTAMP WHERE order_code = ?');
+            $stmt->execute([$orderCode]);
+        }
+        if ($stmt->rowCount() === 0) {
+            json_error('Order not found.', 404);
+        }
+        json_response(['ok' => true]);
     }
 
-    $stmt = $pdo->prepare('SELECT name FROM admin_accounts WHERE id = ?');
-    $stmt->execute([$actor['row_id']]);
-    $adminName = (string) $stmt->fetchColumn();
+    // Bulk move to Trash
+    if ($action === 'bulk_trash') {
+        $ids = array_values(array_filter(array_map('strval', $body['ids'] ?? [])));
+        if (!$ids) {
+            json_error('No orders specified.', 400);
+        }
+        $placeholders = implode(',', array_fill(0, count($ids), '?'));
+        if ($actor['type'] === 'store') {
+            require_store_permission($pdo, $actor, 'order');
+            $pdo->prepare("UPDATE orders SET deleted = 1, updated_at = CURRENT_TIMESTAMP WHERE order_code IN ($placeholders) AND store_id = ?")
+                ->execute(array_merge($ids, [$actor['owner_row_id']]));
+        } else {
+            require_admin_permission($pdo, $actor, 'orders');
+            $pdo->prepare("UPDATE orders SET deleted = 1, updated_at = CURRENT_TIMESTAMP WHERE order_code IN ($placeholders)")->execute($ids);
+        }
+        json_response(['ok' => true]);
+    }
 
-    // Restock: a manual, one-time action on a cancelled/issue order — never automatic.
-    if (($body['action'] ?? '') === 'restock') {
+    // Bulk status change
+    if ($action === 'bulk_status') {
+        $ids = array_values(array_filter(array_map('strval', $body['ids'] ?? [])));
+        $status = str_field($body, 'status');
+        if (!$ids) {
+            json_error('No orders specified.', 400);
+        }
+        if (!in_array($status, ORDER_STATUSES, true)) {
+            json_error('Invalid status.', 400);
+        }
+        require_admin();
+        require_admin_permission($pdo, $actor, 'orders');
+
+        $stmt = $pdo->prepare('SELECT name FROM admin_accounts WHERE id = ?');
+        $stmt->execute([$actor['row_id']]);
+        $adminName = (string) $stmt->fetchColumn();
+
+        $placeholders = implode(',', array_fill(0, count($ids), '?'));
+        $pdo->prepare("UPDATE orders SET status = ?, last_updated_by_name = ?, updated_at = CURRENT_TIMESTAMP WHERE order_code IN ($placeholders) AND deleted = 0")
+            ->execute(array_merge([$status, $adminName], $ids));
+        json_response(['ok' => true]);
+    }
+
+    // Restore from Trash (admin-only)
+    if ($action === 'restore') {
+        require_admin();
+        require_admin_permission($pdo, $actor, 'trash');
+        $orderCode = str_field($body, 'id');
+        if ($orderCode === '') {
+            json_error('Missing order id.', 400);
+        }
+        $stmt = $pdo->prepare('UPDATE orders SET deleted = 0, updated_at = CURRENT_TIMESTAMP WHERE order_code = ?');
+        $stmt->execute([$orderCode]);
+        if ($stmt->rowCount() === 0) {
+            json_error('Order not found.', 404);
+        }
+        json_response(['ok' => true]);
+    }
+
+    // Restock: a manual, one-time action on a cancelled/issue/returned
+    // order — never automatic.
+    if ($action === 'restock') {
+        require_admin();
+        require_admin_permission($pdo, $actor, 'orders');
+        $orderCode = str_field($body, 'id');
+
+        $stmt = $pdo->prepare('SELECT name FROM admin_accounts WHERE id = ?');
+        $stmt->execute([$actor['row_id']]);
+        $adminName = (string) $stmt->fetchColumn();
+
         $pdo->beginTransaction();
         try {
-            $stmt = $pdo->prepare("SELECT id, product_id, qty, status, restocked FROM orders WHERE order_code = ? FOR UPDATE");
+            $stmt = $pdo->prepare('SELECT id, product_id, qty, status, restocked FROM orders WHERE order_code = ? FOR UPDATE');
             $stmt->execute([$orderCode]);
             $order = $stmt->fetch();
             if (!$order) {
@@ -168,9 +258,9 @@ if ($method === 'PATCH') {
                 $pdo->rollBack();
                 json_error('This order has already been restocked.', 409);
             }
-            if (!in_array($order['status'], ['cancelled', 'issue'], true)) {
+            if (!in_array($order['status'], RESTOCK_ELIGIBLE_STATUSES, true)) {
                 $pdo->rollBack();
-                json_error('Only cancelled or issue orders can be restocked.', 400);
+                json_error('Only cancelled, issue, or returned orders can be restocked.', 400);
             }
             if ($order['product_id']) {
                 $pdo->prepare('UPDATE products SET qty = qty + ? WHERE id = ?')->execute([$order['qty'], $order['product_id']]);
@@ -186,9 +276,20 @@ if ($method === 'PATCH') {
         json_response(['ok' => true]);
     }
 
-    $validStatuses = ['pending', 'transit', 'delivered', 'issue', 'cancelled'];
+    // Single order update (admin dispatch update)
+    require_admin();
+    require_admin_permission($pdo, $actor, 'orders');
+    $orderCode = str_field($body, 'id');
+    if ($orderCode === '') {
+        json_error('Missing order id.', 400);
+    }
+
+    $stmt = $pdo->prepare('SELECT name FROM admin_accounts WHERE id = ?');
+    $stmt->execute([$actor['row_id']]);
+    $adminName = (string) $stmt->fetchColumn();
+
     $status = str_field($body, 'status');
-    if (!in_array($status, $validStatuses, true)) {
+    if (!in_array($status, ORDER_STATUSES, true)) {
         json_error('Invalid status.', 400);
     }
     $rider = str_field($body, 'rider');
@@ -209,6 +310,25 @@ if ($method === 'PATCH') {
         }
     }
 
+    json_response(['ok' => true]);
+}
+
+if ($method === 'DELETE') {
+    // Permanent delete — admin with 'trash' permission only, and only
+    // ever on an order that's already sitting in Trash.
+    require_admin();
+    require_admin_permission($pdo, $actor, 'trash');
+    $body = read_json_body();
+    $orderCode = str_field($body, 'id');
+    if ($orderCode === '') {
+        json_error('Missing order id.', 400);
+    }
+
+    $stmt = $pdo->prepare('DELETE FROM orders WHERE order_code = ? AND deleted = 1');
+    $stmt->execute([$orderCode]);
+    if ($stmt->rowCount() === 0) {
+        json_error('Order not found in Trash.', 404);
+    }
     json_response(['ok' => true]);
 }
 

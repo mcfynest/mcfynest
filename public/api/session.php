@@ -2,10 +2,6 @@
 declare(strict_types=1);
 require_once __DIR__ . '/../includes/bootstrap_api.php';
 
-if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
-    json_error('Method not allowed.', 405);
-}
-
 $actor = current_actor();
 $out = null;
 if ($actor && $actor['type'] === 'store') {
