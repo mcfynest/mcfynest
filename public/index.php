@@ -22,6 +22,7 @@ declare(strict_types=1);
 <body>
 <div id="root" class="app"></div>
 <div id="toast" class="toast"></div>
+<div id="print-area" class="print-only"></div>
 <script src="assets/js/app.js"></script>
 </body>
 </html>

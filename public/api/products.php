@@ -9,8 +9,19 @@ $method = $_SERVER['REQUEST_METHOD'];
 if ($method === 'GET') {
     if ($actor['type'] === 'admin') {
         require_admin_permission($pdo, $actor, 'inventory');
+
+        // Lightweight count-only mode for the quiet-poll bell badge —
+        // never returns row data, just how many products are at/under
+        // the low-stock threshold right now.
+        if (str_field($_GET, 'lowstock_count') === '1') {
+            $threshold = defined('LOW_STOCK_THRESHOLD') ? LOW_STOCK_THRESHOLD : 1;
+            $stmt = $pdo->prepare('SELECT COUNT(*) FROM products WHERE deleted = 0 AND qty <= ?');
+            $stmt->execute([$threshold]);
+            json_response(['count' => (int) $stmt->fetchColumn()]);
+        }
+
         $storeFilter = str_field($_GET, 'store_id');
-        $sql = 'SELECT p.id, p.name, p.qty, p.dropped_off_at, p.created_at, s.store_name, s.store_id
+        $sql = 'SELECT p.id, p.name, p.qty, p.dropped_off_at, p.created_at, p.qty_updated_at, p.qty_updated_by, s.store_name, s.store_id
                 FROM products p JOIN stores s ON s.id = p.store_id WHERE p.deleted = 0';
         $params = [];
         if ($storeFilter !== '' && $storeFilter !== 'all') {
@@ -26,12 +37,16 @@ if ($method === 'GET') {
     // Store actor (owner or team member) — a team member sees every
     // product their store holds, same as the owner. The "primarily
     // responsible for" tags are reference-only and don't filter this list.
-    $stmt = $pdo->prepare('SELECT id, name, qty, dropped_off_at, created_at FROM products WHERE store_id = ? AND deleted = 0 ORDER BY name');
+    // qty_updated_at/qty_updated_by are included so a store can see who
+    // (which admin) last confirmed their stock count and when.
+    $stmt = $pdo->prepare('SELECT id, name, qty, dropped_off_at, created_at, qty_updated_at, qty_updated_by FROM products WHERE store_id = ? AND deleted = 0 ORDER BY name');
     $stmt->execute([$actor['owner_row_id']]);
     json_response(['products' => $stmt->fetchAll()]);
 }
 
 if ($method === 'POST') {
+    // Logging a brand-new drop-off stays store-only — this is the one
+    // inventory action a store keeps full self-service control over.
     if ($actor['type'] !== 'store') {
         json_error('Only a store can log stock drop-offs.', 403);
     }
@@ -56,13 +71,24 @@ if ($method === 'POST') {
 }
 
 if ($method === 'PATCH') {
-    if ($actor['type'] !== 'store') {
-        json_error('Only a store can adjust stock.', 403);
-    }
-    require_store_permission($pdo, $actor, 'inventory');
+    // Everything past this point is admin-only. This is a real
+    // integrity fix, not a UI-only restriction: a store could
+    // previously call this endpoint directly (bypassing hidden
+    // buttons) to quietly inflate stock after an order had already
+    // been placed against it, or erase a logged row entirely. Both
+    // quantity adjustment and row deletion/removal now require an
+    // authenticated admin actor with the 'inventory' permission —
+    // stores are limited server-side to viewing their inventory and
+    // logging brand-new drop-offs (handled above in POST).
+    require_admin();
+    require_admin_permission($pdo, $actor, 'inventory');
 
     $body = read_json_body();
     $action = str_field($body, 'action');
+
+    $stmt = $pdo->prepare('SELECT name FROM admin_accounts WHERE id = ?');
+    $stmt->execute([$actor['row_id']]);
+    $adminName = (string) $stmt->fetchColumn();
 
     // Bulk delete
     if ($action === 'bulk_delete') {
@@ -71,8 +97,7 @@ if ($method === 'PATCH') {
             json_error('No products specified.', 400);
         }
         $placeholders = implode(',', array_fill(0, count($ids), '?'));
-        $pdo->prepare("UPDATE products SET deleted = 1 WHERE id IN ($placeholders) AND store_id = ?")
-            ->execute(array_merge($ids, [$actor['owner_row_id']]));
+        $pdo->prepare("UPDATE products SET deleted = 1 WHERE id IN ($placeholders)")->execute($ids);
         json_response(['ok' => true]);
     }
 
@@ -82,15 +107,17 @@ if ($method === 'PATCH') {
         if ($id <= 0) {
             json_error('No product specified.', 400);
         }
-        $stmt = $pdo->prepare('UPDATE products SET deleted = 1 WHERE id = ? AND store_id = ?');
-        $stmt->execute([$id, $actor['owner_row_id']]);
+        $stmt = $pdo->prepare('UPDATE products SET deleted = 1 WHERE id = ?');
+        $stmt->execute([$id]);
         if ($stmt->rowCount() === 0) {
             json_error('Product not found.', 404);
         }
         json_response(['ok' => true]);
     }
 
-    // Quantity adjustment (existing behavior)
+    // Quantity adjustment — confirming stock against what was
+    // physically received. Every adjustment is timestamped and
+    // attributed for accounting.
     $id = (int) ($body['id'] ?? 0);
     $delta = (int) num_field($body, 'delta', 0);
 
@@ -98,18 +125,17 @@ if ($method === 'PATCH') {
         json_error('Nothing to update.', 400);
     }
 
-    // Ownership check happens in the WHERE clause — a store can only ever
-    // touch its own store's products, enforced here server-side.
-    $stmt = $pdo->prepare('UPDATE products SET qty = GREATEST(0, qty + ?) WHERE id = ? AND store_id = ? AND deleted = 0');
-    $stmt->execute([$delta, $id, $actor['owner_row_id']]);
+    $stmt = $pdo->prepare('UPDATE products SET qty = GREATEST(0, qty + ?), qty_updated_at = CURRENT_TIMESTAMP, qty_updated_by = ? WHERE id = ? AND deleted = 0');
+    $stmt->execute([$delta, $adminName, $id]);
 
     if ($stmt->rowCount() === 0) {
         json_error('Product not found.', 404);
     }
 
-    $stmt = $pdo->prepare('SELECT qty FROM products WHERE id = ?');
+    $stmt = $pdo->prepare('SELECT qty, qty_updated_at, qty_updated_by FROM products WHERE id = ?');
     $stmt->execute([$id]);
-    json_response(['id' => $id, 'qty' => (int) $stmt->fetchColumn()]);
+    $row = $stmt->fetch();
+    json_response(['id' => $id, 'qty' => (int) $row['qty'], 'qtyUpdatedAt' => $row['qty_updated_at'], 'qtyUpdatedBy' => $row['qty_updated_by']]);
 }
 
 json_error('Method not allowed.', 405);

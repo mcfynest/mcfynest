@@ -13,6 +13,7 @@ function withdrawal_row_for_client(array $w): array
         'store' => $w['store_name'] ?? null,
         'amount' => (float) $w['amount'],
         'status' => $w['status'],
+        'seenByAdmin' => (bool) ($w['seen_by_admin'] ?? true),
         'requestedAt' => strtotime($w['requested_at']) * 1000,
         'bankName' => $w['bank_name'] ?? null,
         'accountNumber' => $w['bank_account_number'] ?? null,
@@ -23,6 +24,12 @@ function withdrawal_row_for_client(array $w): array
 if ($method === 'GET') {
     if ($actor['type'] === 'admin') {
         require_admin_permission($pdo, $actor, 'withdrawals');
+
+        // Lightweight count-only mode for the quiet-poll bell badge.
+        if (str_field($_GET, 'count') === '1') {
+            $stmt = $pdo->query("SELECT COUNT(*) FROM withdrawals WHERE status = 'pending' AND seen_by_admin = 0");
+            json_response(['count' => (int) $stmt->fetchColumn()]);
+        }
 
         $pending = $pdo->query("SELECT w.*, s.store_name, s.bank_name, s.bank_account_number, s.bank_account_name
             FROM withdrawals w JOIN stores s ON s.id = w.store_id
@@ -56,8 +63,16 @@ if ($method === 'GET') {
 }
 
 if ($method === 'POST') {
-    $actor = require_store_owner();
     $body = read_json_body();
+
+    if (($body['action'] ?? '') === 'mark_seen') {
+        require_admin();
+        require_admin_permission($pdo, $actor, 'withdrawals');
+        $pdo->exec("UPDATE withdrawals SET seen_by_admin = 1 WHERE status = 'pending' AND seen_by_admin = 0");
+        json_response(['ok' => true]);
+    }
+
+    $actor = require_store_owner();
     $amount = num_field($body, 'amount', 0);
 
     if ($amount <= 0) {
