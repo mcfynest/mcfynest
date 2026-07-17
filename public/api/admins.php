@@ -50,18 +50,35 @@ if ($method === 'POST') {
 if ($method === 'PATCH') {
     $body = read_json_body();
     $rowId = (int) ($body['id'] ?? 0);
-    $newPassword = (string) ($body['new_password'] ?? '');
 
-    if ($rowId <= 0 || strlen($newPassword) < 6) {
-        json_error('New password must be at least 6 characters.', 400);
-    }
-
-    $stmt = $pdo->prepare('UPDATE admin_accounts SET password_hash = ? WHERE id = ? AND is_active = 1');
-    $stmt->execute([password_hash($newPassword, PASSWORD_BCRYPT), $rowId]);
-    if ($stmt->rowCount() === 0) {
+    $stmt = $pdo->prepare('SELECT id FROM admin_accounts WHERE id = ? AND is_active = 1');
+    $stmt->execute([$rowId]);
+    if (!$stmt->fetchColumn()) {
         json_error('Admin login not found.', 404);
     }
-    json_response(['id' => $rowId, 'new_password' => $newPassword]);
+
+    $response = ['id' => $rowId];
+
+    if (array_key_exists('permissions', $body)) {
+        $checkedPerms = array_map('strval', $body['permissions'] ?? []);
+        $permissions = build_permissions($checkedPerms, ADMIN_PERM_KEYS);
+        $pdo->prepare('UPDATE admin_accounts SET permissions = ? WHERE id = ?')->execute([json_encode($permissions), $rowId]);
+    }
+
+    if (array_key_exists('position', $body)) {
+        $pdo->prepare('UPDATE admin_accounts SET position = ? WHERE id = ?')->execute([str_field($body, 'position') ?: null, $rowId]);
+    }
+
+    if (!empty($body['new_password'])) {
+        $newPassword = (string) $body['new_password'];
+        if (strlen($newPassword) < 6) {
+            json_error('New password must be at least 6 characters.', 400);
+        }
+        $pdo->prepare('UPDATE admin_accounts SET password_hash = ? WHERE id = ?')->execute([password_hash($newPassword, PASSWORD_BCRYPT), $rowId]);
+        $response['new_password'] = $newPassword;
+    }
+
+    json_response($response);
 }
 
 if ($method === 'DELETE') {

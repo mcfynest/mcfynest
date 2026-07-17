@@ -11,10 +11,10 @@ if ($method === 'GET') {
         require_admin_permission($pdo, $actor, 'inventory');
         $storeFilter = str_field($_GET, 'store_id');
         $sql = 'SELECT p.id, p.name, p.qty, p.dropped_off_at, p.created_at, s.store_name, s.store_id
-                FROM products p JOIN stores s ON s.id = p.store_id';
+                FROM products p JOIN stores s ON s.id = p.store_id WHERE p.deleted = 0';
         $params = [];
         if ($storeFilter !== '' && $storeFilter !== 'all') {
-            $sql .= ' WHERE s.store_id = ?';
+            $sql .= ' AND s.store_id = ?';
             $params[] = $storeFilter;
         }
         $sql .= ' ORDER BY s.store_name, p.name';
@@ -26,7 +26,7 @@ if ($method === 'GET') {
     // Store actor (owner or team member) — a team member sees every
     // product their store holds, same as the owner. The "primarily
     // responsible for" tags are reference-only and don't filter this list.
-    $stmt = $pdo->prepare('SELECT id, name, qty, dropped_off_at, created_at FROM products WHERE store_id = ? ORDER BY name');
+    $stmt = $pdo->prepare('SELECT id, name, qty, dropped_off_at, created_at FROM products WHERE store_id = ? AND deleted = 0 ORDER BY name');
     $stmt->execute([$actor['owner_row_id']]);
     json_response(['products' => $stmt->fetchAll()]);
 }
@@ -62,6 +62,35 @@ if ($method === 'PATCH') {
     require_store_permission($pdo, $actor, 'inventory');
 
     $body = read_json_body();
+    $action = str_field($body, 'action');
+
+    // Bulk delete
+    if ($action === 'bulk_delete') {
+        $ids = array_map('intval', $body['ids'] ?? []);
+        if (!$ids) {
+            json_error('No products specified.', 400);
+        }
+        $placeholders = implode(',', array_fill(0, count($ids), '?'));
+        $pdo->prepare("UPDATE products SET deleted = 1 WHERE id IN ($placeholders) AND store_id = ?")
+            ->execute(array_merge($ids, [$actor['owner_row_id']]));
+        json_response(['ok' => true]);
+    }
+
+    // Single delete
+    if ($action === 'delete') {
+        $id = (int) ($body['id'] ?? 0);
+        if ($id <= 0) {
+            json_error('No product specified.', 400);
+        }
+        $stmt = $pdo->prepare('UPDATE products SET deleted = 1 WHERE id = ? AND store_id = ?');
+        $stmt->execute([$id, $actor['owner_row_id']]);
+        if ($stmt->rowCount() === 0) {
+            json_error('Product not found.', 404);
+        }
+        json_response(['ok' => true]);
+    }
+
+    // Quantity adjustment (existing behavior)
     $id = (int) ($body['id'] ?? 0);
     $delta = (int) num_field($body, 'delta', 0);
 
@@ -71,7 +100,7 @@ if ($method === 'PATCH') {
 
     // Ownership check happens in the WHERE clause — a store can only ever
     // touch its own store's products, enforced here server-side.
-    $stmt = $pdo->prepare('UPDATE products SET qty = GREATEST(0, qty + ?) WHERE id = ? AND store_id = ?');
+    $stmt = $pdo->prepare('UPDATE products SET qty = GREATEST(0, qty + ?) WHERE id = ? AND store_id = ? AND deleted = 0');
     $stmt->execute([$delta, $id, $actor['owner_row_id']]);
 
     if ($stmt->rowCount() === 0) {

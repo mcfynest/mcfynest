@@ -1,4 +1,4 @@
-/* McFynest Logistics — production frontend. Vanilla JS, talks to
+/* McFynest Logistics — v3 production frontend. Vanilla JS, talks to
  * /api/*.php over fetch(). The render() function preserves focus/
  * selection/typed values across re-renders — a hard requirement carried
  * over from the prototype (an earlier auto-refresh design wiped
@@ -7,17 +7,30 @@
  * of the DOM directly — they never call render(). */
 
 const STATUSES = [
-  {v:'pending', label:'Pending dispatch', badge:'badge-pending'},
-  {v:'transit', label:'Out for delivery', badge:'badge-transit'},
-  {v:'delivered', label:'Delivered', badge:'badge-delivered'},
-  {v:'issue', label:'Issue / unreachable', badge:'badge-issue'},
-  {v:'cancelled', label:'Cancelled', badge:'badge-cancelled'},
+  {v:'pending', label:'Pending dispatch', badge:'badge-pending', dim:'var(--orange-dim)', solid:'var(--orange)'},
+  {v:'scheduled', label:'Scheduled', badge:'badge-scheduled', dim:'var(--purple-dim)', solid:'var(--purple)'},
+  {v:'shipped', label:'Shipped', badge:'badge-shipped', dim:'var(--teal-dim)', solid:'var(--teal)'},
+  {v:'transit', label:'Out for delivery', badge:'badge-transit', dim:'var(--blue-dim)', solid:'var(--blue)'},
+  {v:'delivered', label:'Delivered', badge:'badge-delivered', dim:'var(--green-dim)', solid:'var(--green)'},
+  {v:'remitted', label:'Remitted', badge:'badge-remitted', dim:'var(--pink-dim)', solid:'var(--pink)'},
+  {v:'notpicking', label:'Not picking calls', badge:'badge-notpicking', dim:'var(--gold-dim)', solid:'var(--gold)'},
+  {v:'issue', label:'Issue / unreachable', badge:'badge-issue', dim:'var(--red-dim)', solid:'var(--red)'},
+  {v:'returned', label:'Returned', badge:'badge-returned', dim:'var(--purple-dim)', solid:'var(--purple)'},
+  {v:'cancelled', label:'Cancelled', badge:'badge-cancelled', dim:'#EAEAEA', solid:'#666'},
 ];
 const statusMeta = v => STATUSES.find(s=>s.v===v) || STATUSES[0];
-const LOW_STOCK_THRESHOLD = 1;
+const LOW_STOCK_THRESHOLD = 1;       // inline badge/banner — qty<=1 ("low"/"out")
+const POPUP_LOW_STOCK_THRESHOLD = 2; // login popup — "2 or fewer units" per spec
 const IDLE_LIMIT_MS = 30 * 60 * 1000;
-const REMEMBERED_STORE_KEY = 'mcf_remembered_store';
-const REMEMBERED_ADMIN_KEY = 'mcf_remembered_admin';
+const REMEMBERED_KEY = 'mcf_remembered_login';
+const GREETINGS = [
+  "we're here to help you keep every delivery on track today.",
+  "let's make today's deliveries smooth and stress-free.",
+  "ready to get your orders moving?",
+  "here's to another day of on-time deliveries.",
+  "let's keep the wheels turning today.",
+  "your dispatch team has your back today.",
+];
 
 const STORE_TEAM_PERMS = [
   {k:'order', label:'New Order'}, {k:'inventory', label:'Stock Drop-offs'}, {k:'history', label:'Order History'},
@@ -25,7 +38,11 @@ const STORE_TEAM_PERMS = [
 const ADMIN_PERMS = [
   {k:'orders', label:'Orders'}, {k:'inventory', label:'Inventory'}, {k:'stores', label:'Stores'},
   {k:'team', label:'Admin Team'}, {k:'withdrawals', label:'Withdrawals'}, {k:'expenses', label:'Expenses'},
+  {k:'trash', label:'Deleted Orders'},
 ];
+const STORE_SIDEBAR_ICONS = {orders:'📦', inventory:'📥', team:'👥', wallet:'💳', report:'📊'};
+const ADMIN_SIDEBAR_ICONS = {orders:'📦', inventory:'📥', stores:'🏬', team:'👥', withdrawals:'💳', expenses:'📊', trash:'🗑️', report:'📊'};
+const ADMIN_SIDEBAR_LABELS = {orders:'Orders', inventory:'Inventory', stores:'Stores', team:'Admin Team', withdrawals:'Withdrawals', expenses:'Expenses', trash:'Deleted Orders', report:'Report'};
 
 let csrfToken = null;
 let actor = null;
@@ -47,27 +64,31 @@ let adminAccounts = [];
 let adminAdmins = [];
 let adminWithdrawals = {pending:[], resolved:[]};
 let adminExpenses = {feesEarned:0, totalExpenses:0, netProfit:0, expenses:[]};
+let adminTrash = [];
 let resetRequestsStore = [];
 let resetRequestsAdmin = [];
 let unseenCount = 0;
 let unseenOrders = [];
 
-let reportData = {store:null, rows:[], totals:{amount:0, charge:0, balance:0}};
+let reportData = {store:null, storeId:null, rows:[], totals:{amount:0, charge:0, balance:0}};
+let reportDrillDay = null; // when set, report shows the detailed table for this day only
 
-let storeTab = 'order';
-let adminTab = 'orders';
-let loginPickMode = null;   // 'store' | 'admin' | null (role screen)
-let forgotMode = null;      // 'store' | 'admin' | null
-let forgotSentContact = null;
+let activeSection = 'orders';
 let loginError = '';
+let forgotType = null;      // 'store' | 'admin' | null (forgot form open when non-null)
+let forgotSentContact = null;
 let modalOrder = null;
 let popupOpen = false;
 let reportPopupOpen = false;
+let lowStockPopupOpen = false;
 let pwChangeOpen = false;
 let greetingDismissed = false;
+let greetingMsg = '';
 let resetPwTarget = null;   // {kind:'agent'|'store'|'admin', id, label}
 let onceCred = null;        // {label, storeId, password} shown right after creating/resetting a login
 let expandedStores = new Set();
+let selectedOrderIds = new Set();
+let selectedInvIds = new Set();
 let busy = false;
 let pollTimer = null;
 let idleTimer = null;
@@ -126,10 +147,29 @@ async function boot(){
     actor = s.actor;
   }catch(e){ /* stay logged out */ }
   booted = true;
-  if (actor && actor.type === 'store'){ await loadStoreData(); await checkForSentReports(); startIdleTimer(); }
-  else if (actor && actor.type === 'admin'){ await loadAdminData(); await checkForNewOrders(); startQuietPoll(); startIdleTimer(); }
+  if (actor && actor.type === 'store'){
+    activeSection = defaultStoreSection();
+    await loadStoreData(); await checkForSentReports(); checkForLowStock(); startIdleTimer();
+  } else if (actor && actor.type === 'admin'){
+    activeSection = defaultAdminSection();
+    await loadAdminData(); await checkForNewOrders(); startQuietPoll(); startIdleTimer();
+  }
   render();
   registerServiceWorker();
+}
+
+function defaultStoreSection(){
+  if (!actor) return 'orders';
+  const perms = actor.is_primary ? {order:true, inventory:true, history:true} : (actor.permissions || {});
+  if (perms.order || perms.history) return 'orders';
+  if (perms.inventory) return 'inventory';
+  return 'wallet';
+}
+function defaultAdminSection(){
+  if (!actor) return 'orders';
+  const perms = actor.permissions || {};
+  for (const k of ['orders','inventory','stores','team','withdrawals','expenses']){ if (perms[k]) return k; }
+  return 'report';
 }
 
 /* ---------------- IDLE AUTO-LOGOUT (30 min of no clicks/typing) ---------------- */
@@ -140,7 +180,7 @@ function startIdleTimer(){
     if (actor && Date.now() - lastActivityAt > IDLE_LIMIT_MS){
       stopIdleTimer(); stopQuietPoll();
       try{ await api('logout.php', {method:'POST'}); }catch(e){}
-      actor = null; storeTab='order'; adminTab='orders'; popupOpen=false; loginPickMode=null;
+      actor = null; activeSection='orders'; popupOpen=false;
       showToast("You've been logged out after 30 minutes of inactivity");
       render();
     }
@@ -184,11 +224,9 @@ async function loadStoreData(){
   } else {
     myAgents = [];
   }
-  // Wallet is one of the two tabs every team member always has, and can
-  // be the very first tab shown (e.g. a team member with every other
-  // permission unchecked) — load it eagerly so it's never stale on
-  // first paint, not just when the tab is clicked.
-  try{ await loadWalletData(); }catch(e){ /* non-fatal — tab click will retry */ }
+  // Wallet is always visible (view-only for team members) — load it
+  // eagerly so it's never stale on first paint, not just on tab click.
+  try{ await loadWalletData(); }catch(e){ /* non-fatal — section click will retry */ }
 }
 async function loadAdminData(){
   const perms = actor.permissions || {};
@@ -208,6 +246,9 @@ async function checkForNewOrders(){
 }
 async function checkForSentReports(){
   try{ const r = await api('sent-reports.php'); mySentReports = r.pending; if (mySentReports.length){ reportPopupOpen = true; } }catch(e){}
+}
+function checkForLowStock(){
+  if (myProducts.some(i=>i.qty<=POPUP_LOW_STOCK_THRESHOLD)){ lowStockPopupOpen = true; }
 }
 async function loadWalletData(){
   const r = await api('withdrawals.php');
@@ -236,6 +277,27 @@ async function loadExpenses(){
   if (window._expenseDateTo) params.set('date_to', window._expenseDateTo);
   adminExpenses = await api('expenses.php?' + params.toString());
 }
+async function loadTrash(){
+  const r = await api('orders.php?trash=1');
+  adminTrash = r.orders;
+}
+async function reloadAdminOrdersWithDate(){
+  const params = new URLSearchParams();
+  if (window._filterStore && window._filterStore !== 'all') params.set('store_id', window._filterStore);
+  if (window._ordersDateFrom) params.set('date_from', window._ordersDateFrom);
+  if (window._ordersDateTo) params.set('date_to', window._ordersDateTo);
+  const r = await api('orders.php?' + params.toString());
+  adminOrders = r.orders;
+}
+async function reloadStoreOrdersWithDate(){
+  const perms = storePerms();
+  if (!perms.history) return;
+  const params = new URLSearchParams();
+  if (window._historyDateFrom) params.set('date_from', window._historyDateFrom);
+  if (window._historyDateTo) params.set('date_to', window._historyDateTo);
+  const r = await api('orders.php?' + params.toString());
+  myOrders = r.orders;
+}
 
 /* ---------------- RENDER (focus-preserving) ---------------- */
 function render(){
@@ -247,16 +309,14 @@ function render(){
   const selStart = activeEl && typeof activeEl.selectionStart === 'number' ? activeEl.selectionStart : null;
   const selEnd = activeEl && typeof activeEl.selectionEnd === 'number' ? activeEl.selectionEnd : null;
 
-  if (!booted){ root.innerHTML = '<div class="empty">Loading…</div>'; return; }
+  if (!booted){ root.innerHTML = '<div class="empty" style="margin-top:100px;">Loading…</div>'; return; }
   if (!actor){
-    root.innerHTML = roleScreen();
-    if (forgotMode) attachForgotHandlers();
-    else if (loginPickMode) attachLoginHandlers();
-    else attachRoleHandlers();
+    root.innerHTML = loginScreen();
+    if (forgotType) attachForgotHandlers(); else attachLoginHandlers();
     return;
   }
-  if (actor.type === 'store'){ root.innerHTML = storeScreen(); attachStoreHandlers(); }
-  else { root.innerHTML = adminScreen(); attachAdminHandlers(); }
+  root.innerHTML = appShell();
+  attachShellHandlers();
 
   Object.keys(priorValues).forEach(id=>{
     const el = document.getElementById(id);
@@ -281,135 +341,61 @@ function attachPasswordToggles(){
   });
 }
 
-/* ---------------- ROLE SELECT / LOGIN ---------------- */
-function roleScreen(){
-  if (forgotMode) return forgotScreen();
-  if (loginPickMode === 'store') return storeLoginScreen();
-  if (loginPickMode === 'admin') return adminLoginScreen();
+/* ---------------- UNIFIED LOGIN ---------------- */
+function rememberedCreds(){
+  try{ const raw = localStorage.getItem(REMEMBERED_KEY); return raw ? JSON.parse(raw) : null; }catch(e){ return null; }
+}
+function loginScreen(){
+  if (forgotType) return forgotScreen();
+  const remembered = rememberedCreds();
   return `
     <div class="role-screen">
       <div class="display role-title">MCFYNEST LOGISTICS</div>
       <div class="role-tag">Keeping every delivery on track, together.</div>
-      <div class="role-cards">
-        <div class="role-card" id="pick-store">
-          <div class="num">01 — STORE ACCESS</div>
-          <h3>Store Portal</h3>
-          <p>Log in with the Store ID and password your dispatcher created, raise orders, and track them.</p>
-        </div>
-        <div class="role-card" id="pick-admin">
-          <div class="num">02 — DISPATCH ACCESS</div>
-          <h3>Dispatch Admin</h3>
-          <p>See every order and stock level, update status and charges, never miss a new order.</p>
-        </div>
-      </div>
-    </div>`;
-}
-function attachRoleHandlers(){
-  const s = document.getElementById('pick-store');
-  const a = document.getElementById('pick-admin');
-  if (s) s.onclick = () => { loginPickMode='store'; loginError=''; render(); };
-  if (a) a.onclick = () => { loginPickMode='admin'; loginError=''; render(); };
-}
-function rememberedCreds(key){
-  try{ const raw = localStorage.getItem(key); return raw ? JSON.parse(raw) : null; }catch(e){ return null; }
-}
-function storeLoginScreen(){
-  const remembered = rememberedCreds(REMEMBERED_STORE_KEY);
-  return `
-    <div class="role-screen">
-      <div class="display role-title" style="font-size:30px;">STORE LOGIN</div>
-      <div class="role-tag">Enter the Store ID and password your dispatcher gave you.</div>
-      <div class="panel" style="max-width:380px;width:100%;">
-        <label>Store ID</label>
-        <input id="store-id-input" placeholder="e.g. AMK-4821" value="${escapeHtml(remembered?remembered.id:'')}" autocomplete="username" />
+      <div class="login-panel">
+        <label>Login ID <span style="text-transform:none;font-weight:400;">(Store ID or Admin ID)</span></label>
+        <input id="login-id-input" placeholder="e.g. AMK-4821 or ADM-1001" value="${escapeHtml(remembered?remembered.id:'')}" autocomplete="off" />
         <label>Password</label>
         <div class="pw-field">
-          <input id="store-pass-input" type="password" placeholder="Password" value="${escapeHtml(remembered?remembered.password:'')}" autocomplete="current-password" />
-          <button type="button" class="pw-toggle" data-target="store-pass-input" aria-label="Show password">👁</button>
+          <input id="login-pass-input" type="password" placeholder="Password" value="${escapeHtml(remembered?remembered.password:'')}" autocomplete="off" />
+          <button type="button" class="pw-toggle" data-target="login-pass-input" aria-label="Show password">👁</button>
         </div>
         <label style="display:flex;align-items:center;gap:8px;text-transform:none;font-weight:400;font-size:13px;color:var(--ink);">
-          <input type="checkbox" id="store-remember-cb" style="width:auto;margin:0;" ${remembered?'checked':''}> Remember my Store ID and password on this device
+          <input type="checkbox" id="login-remember-cb" style="width:auto;margin:0;" ${remembered?'checked':''}> Remember my ID and password on this device
         </label>
         ${loginError ? `<div class="alert-banner">${escapeHtml(loginError)}</div>` : ''}
-        <button class="btn" id="store-enter-btn" style="width:100%;" ${busy?'disabled':''}>${busy?'<span class="spinner-inline"></span>':'Enter portal'}</button>
-        <button class="btn-outline btn" id="login-back-btn" style="width:100%;margin-top:10px;background:none;color:var(--ink);">Back</button>
-        <div style="text-align:center;margin-top:14px;"><a href="#" id="store-forgot-link" style="font-size:12px;color:var(--slate);">Forgot your Store ID or password?</a></div>
-      </div>
-    </div>`;
-}
-function adminLoginScreen(){
-  const remembered = rememberedCreds(REMEMBERED_ADMIN_KEY);
-  return `
-    <div class="role-screen">
-      <div class="display role-title" style="font-size:30px;">DISPATCH LOGIN</div>
-      <div class="role-tag">Sign in with your dispatch admin ID and password.</div>
-      <div class="panel" style="max-width:380px;width:100%;">
-        <label>Admin ID</label>
-        <input id="admin-id-input" placeholder="e.g. ADM-1001" value="${escapeHtml(remembered?remembered.id:'')}" autocomplete="username" />
-        <label>Password</label>
-        <div class="pw-field">
-          <input id="admin-pass-input" type="password" placeholder="Password" value="${escapeHtml(remembered?remembered.password:'')}" autocomplete="current-password" />
-          <button type="button" class="pw-toggle" data-target="admin-pass-input" aria-label="Show password">👁</button>
-        </div>
-        <label style="display:flex;align-items:center;gap:8px;text-transform:none;font-weight:400;font-size:13px;color:var(--ink);">
-          <input type="checkbox" id="admin-remember-cb" style="width:auto;margin:0;" ${remembered?'checked':''}> Remember my Admin ID and password on this device
-        </label>
-        ${loginError ? `<div class="alert-banner">${escapeHtml(loginError)}</div>` : ''}
-        <button class="btn" id="admin-enter-btn" style="width:100%;" ${busy?'disabled':''}>${busy?'<span class="spinner-inline"></span>':'Enter dispatch board'}</button>
-        <button class="btn-outline btn" id="login-back-btn" style="width:100%;margin-top:10px;background:none;color:var(--ink);">Back</button>
-        <div style="text-align:center;margin-top:14px;"><a href="#" id="admin-forgot-link" style="font-size:12px;color:var(--slate);">Forgot your Admin ID or password?</a></div>
+        <button class="btn" id="login-enter-btn" style="width:100%;" ${busy?'disabled':''}>${busy?'<span class="spinner-inline"></span>':'Log in'}</button>
+        <div style="text-align:center;margin-top:14px;"><a href="#" id="forgot-link" style="font-size:12px;color:var(--slate);">Forgot your ID or password?</a></div>
       </div>
     </div>`;
 }
 function attachLoginHandlers(){
   attachPasswordToggles();
-  const back = document.getElementById('login-back-btn');
-  if (back) back.onclick = () => { loginPickMode=null; loginError=''; render(); };
-  const storeForgot = document.getElementById('store-forgot-link');
-  if (storeForgot) storeForgot.onclick = (e) => { e.preventDefault(); forgotMode='store'; forgotSentContact=null; render(); };
-  const adminForgot = document.getElementById('admin-forgot-link');
-  if (adminForgot) adminForgot.onclick = (e) => { e.preventDefault(); forgotMode='admin'; forgotSentContact=null; render(); };
+  document.getElementById('forgot-link').onclick = (e)=>{ e.preventDefault(); forgotType='store'; forgotSentContact=null; render(); };
 
-  const storeBtn = document.getElementById('store-enter-btn');
-  if (storeBtn){
-    const tryLogin = async () => {
-      const id = document.getElementById('store-id-input').value.trim();
-      const password = document.getElementById('store-pass-input').value;
-      const remember = document.getElementById('store-remember-cb').checked;
-      if (!id || !password){ showToast('Enter your Store ID and password'); return; }
-      busy = true; render();
-      try{
-        const r = await api('login.php', {method:'POST', body:{mode:'store', id, password}});
-        csrfToken = r.csrf_token; actor = r.actor; loginPickMode=null; loginError=''; greetingDismissed=false;
-        if (remember){ localStorage.setItem(REMEMBERED_STORE_KEY, JSON.stringify({id, password})); }
-        else { localStorage.removeItem(REMEMBERED_STORE_KEY); }
-        await loadStoreData(); await checkForSentReports(); startIdleTimer();
-      }catch(e){ loginError = e.message; }
-      busy = false; render();
-    };
-    storeBtn.onclick = tryLogin;
-    document.getElementById('store-pass-input').addEventListener('keydown', e=>{ if (e.key==='Enter') tryLogin(); });
-  }
-  const adminBtn = document.getElementById('admin-enter-btn');
-  if (adminBtn){
-    const tryLogin = async () => {
-      const id = document.getElementById('admin-id-input').value.trim();
-      const password = document.getElementById('admin-pass-input').value;
-      const remember = document.getElementById('admin-remember-cb').checked;
-      if (!id || !password){ showToast('Enter your admin ID and password'); return; }
-      busy = true; render();
-      try{
-        const r = await api('login.php', {method:'POST', body:{mode:'admin', id, password}});
-        csrfToken = r.csrf_token; actor = r.actor; loginPickMode=null; loginError=''; greetingDismissed=false;
-        if (remember){ localStorage.setItem(REMEMBERED_ADMIN_KEY, JSON.stringify({id, password})); }
-        else { localStorage.removeItem(REMEMBERED_ADMIN_KEY); }
+  const tryLogin = async () => {
+    const id = document.getElementById('login-id-input').value.trim();
+    const password = document.getElementById('login-pass-input').value;
+    const remember = document.getElementById('login-remember-cb').checked;
+    if (!id || !password){ showToast('Enter your ID and password'); return; }
+    busy = true; render();
+    try{
+      const r = await api('login.php', {method:'POST', body:{id, password}});
+      csrfToken = r.csrf_token; actor = r.actor; loginError=''; greetingDismissed=false;
+      if (remember){ localStorage.setItem(REMEMBERED_KEY, JSON.stringify({id, password})); }
+      else { localStorage.removeItem(REMEMBERED_KEY); }
+      if (actor.type === 'store'){
+        activeSection = defaultStoreSection();
+        await loadStoreData(); await checkForSentReports(); checkForLowStock(); startIdleTimer();
+      } else {
+        activeSection = defaultAdminSection();
         await loadAdminData(); await checkForNewOrders(); startQuietPoll(); startIdleTimer();
-      }catch(e){ loginError = e.message; }
-      busy = false; render();
-    };
-    adminBtn.onclick = tryLogin;
-    document.getElementById('admin-pass-input').addEventListener('keydown', e=>{ if (e.key==='Enter') tryLogin(); });
-  }
+      }
+    }catch(e){ loginError = e.message; }
+    busy = false; render();
+  };
+  document.getElementById('login-enter-btn').onclick = tryLogin;
+  document.getElementById('login-pass-input').addEventListener('keydown', e=>{ if (e.key==='Enter') tryLogin(); });
 }
 function forgotScreen(){
   if (forgotSentContact){
@@ -425,10 +411,15 @@ function forgotScreen(){
       <div class="display role-title" style="font-size:28px;">FORGOT LOGIN?</div>
       <div class="role-tag">Tell us who you are and how to reach you — this sends a request to your dispatch admin, who'll verify it's really you and reset your login.</div>
       <div class="panel" style="max-width:380px;width:100%;">
+        <label>I am a</label>
+        <select id="forgot-type-select">
+          <option value="store" ${forgotType==='store'?'selected':''}>Store</option>
+          <option value="admin" ${forgotType==='admin'?'selected':''}>Dispatch admin</option>
+        </select>
         <label>Your name / store name</label>
-        <input id="forgot-label" placeholder="e.g. Amaka's Boutique" />
+        <input id="forgot-label" placeholder="e.g. Amaka's Boutique" autocomplete="off" />
         <label>Your email or phone number</label>
-        <input id="forgot-contact" placeholder="So we can reach you back" />
+        <input id="forgot-contact" placeholder="So we can reach you back" autocomplete="off" />
         <button class="btn" id="forgot-submit-btn" style="width:100%;" ${busy?'disabled':''}>${busy?'<span class="spinner-inline"></span>':'Send request'}</button>
         <button class="btn-outline btn" id="forgot-back-btn" style="width:100%;margin-top:10px;background:none;color:var(--ink);">Back to login</button>
       </div>
@@ -436,9 +427,11 @@ function forgotScreen(){
 }
 function attachForgotHandlers(){
   const doneBtn = document.getElementById('forgot-done-btn');
-  if (doneBtn) doneBtn.onclick = () => { forgotMode=null; forgotSentContact=null; render(); };
+  if (doneBtn) doneBtn.onclick = () => { forgotType=null; forgotSentContact=null; render(); };
   const backBtn = document.getElementById('forgot-back-btn');
-  if (backBtn) backBtn.onclick = () => { loginPickMode = forgotMode; forgotMode=null; render(); };
+  if (backBtn) backBtn.onclick = () => { forgotType=null; render(); };
+  const typeSelect = document.getElementById('forgot-type-select');
+  if (typeSelect) typeSelect.onchange = e => { forgotType = e.target.value; render(); };
   const submitBtn = document.getElementById('forgot-submit-btn');
   if (submitBtn){
     submitBtn.onclick = async () => {
@@ -447,7 +440,7 @@ function attachForgotHandlers(){
       if (!label || !contact){ showToast('Fill in both fields'); return; }
       busy = true; render();
       try{
-        await api('reset-requests.php', {method:'POST', body:{type: forgotMode, label, contact}});
+        await api('reset-requests.php', {method:'POST', body:{type: forgotType, label, contact}});
         forgotSentContact = contact;
       }catch(e){ showToast(e.message); }
       busy = false; render();
@@ -458,49 +451,106 @@ function attachForgotHandlers(){
 /* ---------------- GREETING BANNER ---------------- */
 function greetingBanner(){
   if (greetingDismissed) return '';
+  if (!greetingMsg) greetingMsg = GREETINGS[Math.floor(Math.random()*GREETINGS.length)];
   const hour = new Date().getHours();
   const part = hour < 12 ? 'morning' : hour < 17 ? 'afternoon' : 'evening';
   const fullName = actor.type === 'store' ? actor.store_name : actor.name;
   const firstName = (fullName || '').split(' ')[0];
-  return `<div class="greeting-banner"><span>Good ${part}, ${escapeHtml(firstName)} — we're here to help you keep every delivery on track today.</span><button id="greeting-close-btn">×</button></div>`;
+  return `<div class="greeting-banner"><span>Good ${part}, ${escapeHtml(firstName)} — ${escapeHtml(greetingMsg)}</span><button id="greeting-close-btn">×</button></div>`;
 }
 function attachGreetingHandler(){
   const btn = document.getElementById('greeting-close-btn');
   if (btn) btn.onclick = () => { greetingDismissed = true; render(); };
 }
 
-/* ---------------- HEADER ---------------- */
-function header(){
+/* ---------------- SIDEBAR SHELL ---------------- */
+function storePerms(){ return actor.is_primary ? {order:true, inventory:true, history:true} : (actor.permissions || {}); }
+function storeSidebarItems(){
+  const perms = storePerms();
+  const items = [];
+  if (perms.order || perms.history) items.push({k:'orders', label:'Orders'});
+  if (perms.inventory) items.push({k:'inventory', label:'Inventory'});
+  if (actor.is_primary) items.push({k:'team', label:'Team'});
+  items.push({k:'wallet', label:'Wallet'});
+  items.push({k:'report', label:'Report'});
+  return items.map(i => ({...i, ico: STORE_SIDEBAR_ICONS[i.k]}));
+}
+function adminSidebarItems(){
+  const perms = actor.permissions || {};
+  const keys = ['orders','inventory','stores','team','withdrawals','expenses','trash'];
+  const items = keys.filter(k=>perms[k]).map(k=>({k, label:ADMIN_SIDEBAR_LABELS[k], ico:ADMIN_SIDEBAR_ICONS[k]}));
+  items.push({k:'report', label:'Report', ico:ADMIN_SIDEBAR_ICONS.report});
+  return items;
+}
+function sidebarItems(){ return actor.type === 'store' ? storeSidebarItems() : adminSidebarItems(); }
+
+function appShell(){
+  const items = sidebarItems();
+  if (!items.find(i=>i.k===activeSection)) activeSection = items[0] ? items[0].k : 'orders';
+  return `
+  <div class="shell">
+    <div class="sidebar">
+      <div class="brand"><div class="brand-mark">M</div><div><div class="brand-name">MCFYNEST<br>LOGISTICS</div><div class="brand-sub">Dispatch CRM</div></div></div>
+      <div class="side-section-label">${actor.type==='store'?'Store menu':'Admin menu'}</div>
+      ${items.map(i=>`<div class="side-item ${activeSection===i.k?'active':''}" data-section="${i.k}"><span class="ico">${i.ico}</span> ${i.label}</div>`).join('')}
+    </div>
+    <div class="main">
+      ${topbar()}
+      ${greetingBanner()}
+      ${sectionContent()}
+      ${modalOrder ? updateModal(modalOrder) : ''}
+      ${popupOpen && actor.type==='admin' ? newOrdersPopup(unseenOrders) : ''}
+      ${reportPopupOpen && actor.type==='store' ? sentReportPopup(mySentReports) : ''}
+      ${lowStockPopupOpen && actor.type==='store' ? lowStockPopup() : ''}
+      ${pwChangeOpen ? passwordChangeModal() : ''}
+      ${onceCred ? onceCredBox() : ''}
+      ${resetPwTarget ? resetPasswordModal() : ''}
+    </div>
+  </div>`;
+}
+function sectionContent(){
+  if (actor.type === 'store'){
+    const perms = storePerms();
+    if (activeSection==='orders') return storeOrdersSection();
+    if (activeSection==='inventory' && perms.inventory) return inventorySection(true);
+    if (activeSection==='team' && actor.is_primary) return storeTeamPanel(myProducts, myAgents);
+    if (activeSection==='wallet') return storeWalletPanel();
+    if (activeSection==='report') return reportPanel(false, null);
+    return storeOrdersSection();
+  }
+  const perms = actor.permissions || {};
+  if (activeSection==='orders' && perms.orders) return adminOrdersSection();
+  if (activeSection==='inventory' && perms.inventory) return inventorySection(false);
+  if (activeSection==='stores' && perms.stores) return adminStoresPanel();
+  if (activeSection==='team' && perms.team) return adminTeamPanel();
+  if (activeSection==='withdrawals' && perms.withdrawals) return adminWithdrawalsPanel();
+  if (activeSection==='expenses' && perms.expenses) return adminExpensesPanel();
+  if (activeSection==='trash' && perms.trash) return trashPanel();
+  if (activeSection==='report') return reportPanel(true, reportData.storeOptions || []);
+  return '<div class="empty">Nothing to show here.</div>';
+}
+
+function topbar(){
   let label, extra = '';
   if (actor.type === 'store'){
     label = `Store: <b>${escapeHtml(actor.store_name)}</b>${!actor.is_primary?' · '+escapeHtml(actor.position||'Team member'):''}`;
-    extra = `<button class="pw-change-btn" id="pw-change-open-btn">Change password</button>`;
   } else {
     label = `<b>${escapeHtml(actor.name || 'Dispatch Admin')}</b>${actor.position?' · '+escapeHtml(actor.position):''} <span class="mono" style="color:var(--slate);">(${escapeHtml(actor.admin_id)})</span>`;
-    extra = `<button class="bell-btn" id="bell-btn">Check for new orders${unseenCount?`<span class="bell-count">${unseenCount}</span>`:''}</button>
-             <button class="pw-change-btn" id="pw-change-open-btn">Change password</button>`;
+    extra = `<button class="bell-btn" id="bell-btn">Check for new orders${unseenCount?`<span class="bell-count">${unseenCount}</span>`:''}</button>`;
   }
-  return `
-    <div class="topbar">
-      <div class="brand">
-        <div class="brand-mark">M</div>
-        <div>
-          <div class="brand-name display" style="font-size:18px;">${escapeHtml(appMeta.app_name.toUpperCase())}</div>
-          <div class="brand-sub">Keeping every delivery on track, together.</div>
-        </div>
-      </div>
-      <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;">
-        <div class="session-tag">${label}</div>
-        ${extra}
-        <button class="logout" id="logout-btn">Log out</button>
-      </div>
-    </div>`;
+  return `<div class="topbar">
+    <div class="session-tag">${label}</div>
+    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+      ${extra}<button class="pw-change-btn" id="pw-change-open-btn">Change password</button>
+      <button class="logout" id="logout-btn">Log out</button>
+    </div>
+  </div>`;
 }
 function attachHeaderHandlers(){
   document.getElementById('logout-btn').onclick = async () => {
     stopQuietPoll(); stopIdleTimer();
     try{ const r = await api('logout.php', {method:'POST'}); csrfToken = r.csrf_token; }catch(e){}
-    actor = null; storeTab='order'; adminTab='orders'; popupOpen=false; loginPickMode=null;
+    actor = null; activeSection='orders'; popupOpen=false;
     render();
   };
   const bell = document.getElementById('bell-btn');
@@ -519,9 +569,9 @@ function passwordChangeModal(){
     <h3>Change your password</h3>
     <div class="id">Logged in as ${escapeHtml(label)}</div>
     <label>New password</label>
-    <div class="pw-field"><input id="pw-new" type="password" placeholder="New password" /><button type="button" class="pw-toggle" data-target="pw-new">👁</button></div>
+    <div class="pw-field"><input id="pw-new" type="password" placeholder="New password" autocomplete="new-password" /><button type="button" class="pw-toggle" data-target="pw-new">👁</button></div>
     <label>Confirm new password</label>
-    <div class="pw-field"><input id="pw-confirm" type="password" placeholder="Confirm new password" /><button type="button" class="pw-toggle" data-target="pw-confirm">👁</button></div>
+    <div class="pw-field"><input id="pw-confirm" type="password" placeholder="Confirm new password" autocomplete="new-password" /><button type="button" class="pw-toggle" data-target="pw-confirm">👁</button></div>
     <div class="modal-actions"><button class="btn btn-outline" id="pw-cancel">Cancel</button><button class="btn" id="pw-save" ${busy?'disabled':''}>${busy?'<span class="spinner-inline"></span>':'Save new password'}</button></div>
     </div></div>`;
 }
@@ -546,12 +596,14 @@ function attachPasswordChangeHandlers(){
 }
 function onceCredBox(){
   return `
+    <div class="modal-overlay" id="oncecred-overlay"><div class="modal">
     <div class="once-box">
       <div>${escapeHtml(onceCred.label)}</div>
       <div class="cred">ID: <span class="mono">${escapeHtml(onceCred.storeId)}</span> &nbsp;·&nbsp; Password: <span class="mono">${escapeHtml(onceCred.password)}</span></div>
       <div class="warn">Copy this now — for security we can't show this password again after you leave this screen.</div>
       <button class="btn btn-sm btn-outline" id="once-cred-dismiss" style="margin-top:10px;">I've copied it</button>
-    </div>`;
+    </div>
+    </div></div>`;
 }
 function resetPasswordModal(){
   const t = resetPwTarget;
@@ -562,7 +614,7 @@ function resetPasswordModal(){
         <div class="id">${escapeHtml(t.label)}</div>
         <label>New password (at least 6 characters)</label>
         <div class="pw-field">
-          <input id="reset-pw-input" type="password" placeholder="New password" />
+          <input id="reset-pw-input" type="password" placeholder="New password" autocomplete="new-password" />
           <button type="button" class="pw-toggle" data-target="reset-pw-input" aria-label="Show password">👁</button>
         </div>
         <div class="modal-actions">
@@ -585,7 +637,73 @@ function attachResetPasswordModalHandlers(onSave){
   overlay.addEventListener('click', e => { if (e.target.id==='reset-pw-overlay'){ resetPwTarget=null; render(); } });
 }
 
-/* ---------------- DATE QUICK FILTERS ---------------- */
+function attachShellHandlers(){
+  attachHeaderHandlers();
+  attachPasswordToggles();
+  attachGreetingHandler();
+  attachPasswordChangeHandlers();
+
+  document.querySelectorAll('.side-item[data-section]').forEach(el=>{
+    el.onclick = async () => {
+      activeSection = el.dataset.section; onceCred=null; selectedOrderIds=new Set(); selectedInvIds=new Set(); reportDrillDay=null;
+      render();
+      try{
+        if (activeSection === 'stores' && actor.type==='admin'){ await loadResetRequests('store'); render(); }
+        if (activeSection === 'team' && actor.type==='admin'){ await Promise.all([loadAdminAdmins(), loadResetRequests('admin')]); render(); }
+        if (activeSection === 'withdrawals'){ await loadAdminWithdrawals(); render(); }
+        if (activeSection === 'expenses'){ await loadExpenses(); render(); }
+        if (activeSection === 'trash'){ await loadTrash(); render(); }
+        if (activeSection === 'wallet' && actor.type==='store'){ await loadWalletData(); render(); }
+        if (activeSection === 'report'){
+          await loadReportData(actor.type==='admin' ? window._reportStoreId : null, window._reportSearch);
+          if (actor.type==='admin' && !window._reportStoreId && (reportData.storeOptions||[]).length){
+            window._reportStoreId = reportData.storeOptions[0].store_id;
+            await loadReportData(window._reportStoreId, window._reportSearch);
+          }
+          render();
+        }
+      }catch(e){ showToast(e.message); }
+    };
+  });
+
+  attachOrdersHandlers();
+  attachInventoryHandlers();
+  attachTeamHandlers();
+  attachWalletHandlers();
+  attachStoresHandlers();
+  attachAdminTeamHandlers();
+  attachWithdrawalsHandlers();
+  attachExpensesHandlers();
+  attachTrashHandlers();
+  attachReportHandlers(actor.type==='admin');
+  attachPopupHandlers();
+
+  // Single dispatcher for the reset-password modal, regardless of which
+  // section opened it (agent/store/admin) — must be attached exactly
+  // once per render, since several section handlers above run
+  // unconditionally and would otherwise race to overwrite each other's
+  // save handler on the shared modal.
+  if (resetPwTarget){
+    attachResetPasswordModalHandlers(async (newPassword) => {
+      if (resetPwTarget.kind === 'agent'){
+        const r = await api('team.php', {method:'PATCH', body:{id: resetPwTarget.id, new_password: newPassword}});
+        onceCred = {label:'New password set — share it with your team member:', storeId: myAgents.find(a=>a.id===resetPwTarget.id).store_id, password:r.new_password};
+      } else if (resetPwTarget.kind === 'store'){
+        const r = await api('stores.php', {method:'PATCH', body:{id: resetPwTarget.id, new_password: newPassword}});
+        onceCred = {label:'New password set — share it with them:', storeId: resetPwTarget.label, password:r.new_password};
+      } else if (resetPwTarget.kind === 'admin'){
+        const r = await api('admins.php', {method:'PATCH', body:{id: resetPwTarget.id, new_password: newPassword}});
+        onceCred = {label:'New password set — share it with them:', storeId: resetPwTarget.label, password:r.new_password};
+      }
+      resetPwTarget = null;
+    });
+  }
+
+  const onceDismiss = document.getElementById('once-cred-dismiss');
+  if (onceDismiss) onceDismiss.onclick = () => { onceCred = null; render(); };
+}
+
+/* ---------------- DATE FILTER (quick buttons + custom range) ---------------- */
 function quickRangeDates(range){
   const now = new Date();
   if (range === 'all') return {from:'', to:''};
@@ -596,52 +714,93 @@ function quickRangeDates(range){
 }
 function dateFilterBar(activeKey){
   const q = window[activeKey] || 'all';
+  const fromKey = activeKey.replace('Quick','From'), toKey = activeKey.replace('Quick','To');
   return `<div class="quickdate" style="margin-bottom:18px;">
     <button data-quickdate="all" data-quickkey="${activeKey}" class="${q==='all'?'active':''}">All time</button>
     <button data-quickdate="today" data-quickkey="${activeKey}" class="${q==='today'?'active':''}">Today</button>
     <button data-quickdate="week" data-quickkey="${activeKey}" class="${q==='week'?'active':''}">This week</button>
     <button data-quickdate="month" data-quickkey="${activeKey}" class="${q==='month'?'active':''}">This month</button>
+    <span style="font-size:11px;color:var(--slate);margin-left:2px;">or:</span>
+    <input type="date" id="custom-${activeKey}-from" value="${window[fromKey]||''}" style="width:auto;margin-bottom:0;">
+    <span style="font-size:11px;color:var(--slate);">to</span>
+    <input type="date" id="custom-${activeKey}-to" value="${window[toKey]||''}" style="width:auto;margin-bottom:0;">
+    <button class="btn btn-sm" data-customapply="${activeKey}">Apply</button>
+  </div>`;
+}
+function attachDateFilterHandlers(activeKey, onApply){
+  document.querySelectorAll(`[data-quickdate][data-quickkey="${activeKey}"]`).forEach(btn=>{
+    btn.onclick = async () => {
+      window[activeKey] = btn.dataset.quickdate;
+      const {from, to} = quickRangeDates(btn.dataset.quickdate);
+      window[activeKey.replace('Quick','From')] = from; window[activeKey.replace('Quick','To')] = to;
+      try{ await onApply(); render(); }catch(e){ showToast(e.message); }
+    };
+  });
+  const applyBtn = document.querySelector(`[data-customapply="${activeKey}"]`);
+  if (applyBtn){
+    applyBtn.onclick = async () => {
+      const from = document.getElementById(`custom-${activeKey}-from`).value;
+      const to = document.getElementById(`custom-${activeKey}-to`).value;
+      window[activeKey] = 'custom';
+      window[activeKey.replace('Quick','From')] = from;
+      window[activeKey.replace('Quick','To')] = to;
+      try{ await onApply(); render(); }catch(e){ showToast(e.message); }
+    };
+  }
+}
+
+/* ---------------- STATUS PILLS (replaces stat-number boxes) ---------------- */
+function statusPillRow(list, allForCounts, filterKey){
+  const filterStatus = window[filterKey] || 'all';
+  const counts = {}; STATUSES.forEach(s=>counts[s.v]=0);
+  allForCounts.forEach(o=>counts[o.status]=(counts[o.status]||0)+1);
+  const allActive = filterStatus==='all';
+  return `<div class="pill-row">
+    <div class="pill" data-statfilter="all" data-statkey="${filterKey}" style="${allActive?`background:var(--ink);color:#fff;border-color:var(--ink);`:`background:#fff;color:var(--ink);border-color:var(--ink);`}">All <span class="cnt" style="${allActive?'color:#cfd8e0;':''}">(${allForCounts.length})</span></div>
+    ${STATUSES.map(s=>{ const active=filterStatus===s.v;
+      return `<div class="pill" data-statfilter="${s.v}" data-statkey="${filterKey}" style="${active?`background:${s.solid};color:#fff;border-color:${s.solid};`:`background:${s.dim};color:${s.solid};border-color:${s.solid};`}">${s.label} <span class="cnt" style="${active?'color:rgba(255,255,255,.75);':`color:${s.solid};opacity:.7;`}">(${counts[s.v]})</span></div>`;
+    }).join('')}
+  </div>`;
+}
+function attachStatusPillHandlers(){
+  document.querySelectorAll('[data-statfilter]').forEach(el=>{
+    el.onclick = () => { window[el.dataset.statkey] = el.dataset.statfilter; render(); };
+  });
+}
+
+/* ---------------- BULK ACTION BAR (orders) ---------------- */
+/* Status changes stay admin-only (matches the existing Update modal —
+ * stores have never been able to change order status themselves, only
+ * dispatch can). Stores/team members only get bulk "Move to Trash". */
+function bulkBar(isAdmin){
+  return `<div class="bulkbar">
+    <span>${selectedOrderIds.size} selected</span>
+    <select id="bulk-action-select">
+      <option value="">Bulk action…</option>
+      ${isAdmin ? STATUSES.map(s=>`<option value="status:${s.v}">Mark as ${s.label}</option>`).join('') : ''}
+      <option value="trash">Move to Trash</option>
+    </select>
+    <button class="btn btn-sm" id="bulk-apply-btn">Apply</button>
+    <button class="btn-outline btn btn-sm" id="bulk-clear-btn" style="background:none;">Clear selection</button>
   </div>`;
 }
 
-/* ---------------- STORE ---------------- */
-function storePerms(){ return actor.is_primary ? {order:true, inventory:true, history:true} : (actor.permissions || {}); }
-function storeScreen(){
+/* ---------------- STORE: ORDERS (Add Order + Orders list, combined) ---------------- */
+function storeOrdersSection(){
   const perms = storePerms();
-  const lowItems = myProducts.filter(i=>i.qty<=LOW_STOCK_THRESHOLD);
-  const tabs = [];
-  if (perms.order) tabs.push({k:'order', label:'New order'});
-  if (perms.inventory) tabs.push({k:'inventory', label:`Stock drop-offs (${myProducts.length})`});
-  if (actor.is_primary) tabs.push({k:'team', label:`Team (${myAgents.length})`});
-  if (perms.history) tabs.push({k:'history', label:`Your orders (${myOrders.length})`});
-  tabs.push({k:'wallet', label:'Wallet'});
-  tabs.push({k:'report', label:'Daily report'});
-  if (!tabs.find(t=>t.k===storeTab)) storeTab = tabs[0].k;
-
-  return `
-    ${header()}
-    ${greetingBanner()}
-    ${lowItems.length ? `<div class="alert-banner">⚠ Low stock: ${lowItems.map(i=>escapeHtml(i.name)+' ('+i.qty+' left)').join(', ')}</div>` : ''}
-    <div class="tabs">${tabs.map(t=>`<button class="tab-btn ${storeTab===t.k?'active':''}" data-tab="${t.k}">${t.label}</button>`).join('')}</div>
-    ${storeTab==='order' ? storeOrderPanel(myProducts) : ''}
-    ${storeTab==='inventory' && perms.inventory ? storeInventoryPanel(myProducts) : ''}
-    ${storeTab==='team' && actor.is_primary ? storeTeamPanel(myProducts, myAgents) : ''}
-    ${storeTab==='history' && perms.history ? storeHistoryPanel(myOrders) : ''}
-    ${storeTab==='wallet' ? storeWalletPanel() : ''}
-    ${storeTab==='report' ? reportPanel(false, null) : ''}
-    ${pwChangeOpen ? passwordChangeModal() : ''}
-    ${reportPopupOpen ? sentReportPopup(mySentReports) : ''}
-    ${resetPwTarget && resetPwTarget.kind==='agent' ? resetPasswordModal() : ''}
-  `;
+  let html = '';
+  if (perms.order) html += storeOrderFormPanel(myProducts);
+  if (perms.history) html += storeOrdersListPanel(myOrders);
+  return html || '<div class="empty">You do not have access to Orders.</div>';
 }
-function storeOrderPanel(availableInv){
+function storeOrderFormPanel(availableInv){
   return `
     <div class="panel">
-      <h2><span class="dot"></span>New order — from stock dropped off with us</h2>
+      <h2><span class="dot"></span>Add Order</h2>
       ${availableInv.length===0 ? `
         <div class="empty">
-          You haven't dropped off any stock with us yet.
-          ${storePerms().inventory ? '<br><br><button class="btn" id="goto-inventory-btn">Log a stock drop-off</button>' : ''}
+          You haven't logged any stock yet.
+          ${storePerms().inventory ? '<br><br><button class="btn" id="goto-inventory-btn">Go to Inventory</button>' : ''}
         </div>` : `
       <div class="row3">
         <div><label>Customer name</label><input id="f-customer" placeholder="e.g. Chidi Okafor" /></div>
@@ -663,6 +822,59 @@ function storeOrderPanel(availableInv){
       `}
     </div>`;
 }
+function storeOrdersListPanel(mine){
+  const sorted = mine.slice().sort((a,b)=>b.createdAt-a.createdAt);
+  const searchTerm = (window._historySearch||'').toLowerCase();
+  let list = sorted;
+  const filterStatus = window._historyStatFilter || 'all';
+  if (filterStatus!=='all') list = list.filter(o=>o.status===filterStatus);
+  if (searchTerm) list = list.filter(o=>o.customer.toLowerCase().includes(searchTerm) || o.phone.toLowerCase().includes(searchTerm) || o.id.toLowerCase().includes(searchTerm));
+
+  return `<div class="panel">
+    <h2><span class="dot"></span>Your orders (${list.length})</h2>
+    ${statusPillRow(list, sorted, '_historyStatFilter')}
+    <div class="filters">
+      <input id="search-history" placeholder="Search customer, phone, or order #" value="${escapeHtml(window._historySearch||'')}" />
+      <button class="btn-outline btn" id="search-history-btn" style="padding:9px 14px;">Search</button>
+    </div>
+    ${dateFilterBar('_historyDateQuick')}
+    <label style="display:flex;align-items:center;gap:8px;text-transform:none;font-weight:400;font-size:12.5px;margin-bottom:10px;">
+      <input type="checkbox" id="select-all-cb" style="width:auto;margin:0;" ${list.length && list.every(o=>selectedOrderIds.has(o.id))?'checked':''}> Select all shown
+    </label>
+    ${selectedOrderIds.size?bulkBar(false):''}
+    ${list.length ? list.map(o=>orderRowStub(o)).join('') : '<div class="empty">No orders in this range.</div>'}
+  </div>`;
+}
+function orderRowStub(o){
+  const sm = statusMeta(o.status);
+  const dCharge = (o.deliveryFee||0)+(o.otherCharges||0);
+  return `<div class="stub">
+    <div class="stub-top">
+      <label style="display:flex;align-items:flex-start;gap:10px;text-transform:none;font-weight:400;margin:0;">
+        <input type="checkbox" class="order-select-cb" data-id="${escapeHtml(o.id)}" ${selectedOrderIds.has(o.id)?'checked':''} style="width:auto;margin-top:3px;" />
+        <div><div class="stub-id mono">#${escapeHtml(o.id)}</div><div class="stub-item">${escapeHtml(o.item)}${o.qty>1?' × '+o.qty:''}</div></div>
+      </label>
+      <span class="badge ${sm.badge}">${sm.label}</span>
+    </div>
+    <div class="stub-grid"><div><span class="k">Customer:</span> ${escapeHtml(o.customer)} · ${escapeHtml(o.phone)}${o.altPhone?' / '+escapeHtml(o.altPhone):''}</div><div><span class="k">Deliver to:</span> ${escapeHtml(o.dropoff)}</div></div>
+    ${o.notes ? `<div class="stub-remark"><span class="k">Instructions:</span> ${escapeHtml(o.notes)}</div>` : ''}
+    ${o.remark ? `<div class="stub-remark"><span class="k">Dispatch note:</span> ${escapeHtml(o.remark)}</div>` : ''}
+    <div class="stub-charges">
+      ${o.amount ? `<span>Amount: <b>${money(o.amount)}</b></span>` : ''}
+      ${dCharge ? `<span>Delivery charge: <b>${money(dCharge)}</b></span>` : ''}
+      ${o.amount || dCharge ? `<span>Balance: <b>${money((o.amount||0)-dCharge)}</b></span>` : ''}
+    </div>
+    <div class="stub-meta">Submitted ${new Date(o.createdAt).toLocaleString()}${o.rider ? ' · Rider: '+escapeHtml(o.rider) : ''}${o.lastUpdatedBy ? ' · Last updated by '+escapeHtml(o.lastUpdatedBy) : ''}</div>
+    <div class="modal-actions" style="justify-content:flex-start;margin-top:10px;">
+      <button class="danger-btn" data-store-trash="${escapeHtml(o.id)}">Move to Trash</button>
+    </div>
+  </div>`;
+}
+
+/* ---------------- STORE: INVENTORY ---------------- */
+function inventorySection(isStore){
+  return isStore ? storeInventoryPanel(myProducts) : adminInventoryPanel();
+}
 function storeInventoryPanel(myInv){
   return `
     <div class="panel">
@@ -676,24 +888,99 @@ function storeInventoryPanel(myInv){
       <button class="btn" id="inv-add-btn">Log drop-off</button>
     </div>
     <div class="panel">
-      <h2><span class="dot"></span>Stock we're currently holding for you</h2>
+      <h2><span class="dot"></span>Stock we're currently holding for you (${myInv.length})</h2>
+      ${myInv.length ? `<label style="display:flex;align-items:center;gap:8px;text-transform:none;font-weight:400;font-size:12.5px;margin-bottom:10px;">
+        <input type="checkbox" id="inv-select-all-cb" style="width:auto;margin:0;" ${myInv.every(i=>selectedInvIds.has(i.id))?'checked':''}> Select all
+      </label>` : ''}
+      ${selectedInvIds.size ? `<div class="bulkbar"><span>${selectedInvIds.size} selected</span><button class="btn btn-sm" id="inv-bulk-remove-btn">Remove selected</button><button class="btn-outline btn btn-sm" id="inv-bulk-clear-btn" style="background:none;">Clear selection</button></div>` : ''}
       ${myInv.length ? myInv.map(invRow).join('') : '<div class="empty">Nothing logged yet.</div>'}
     </div>`;
 }
+function invRow(i){
+  const low = i.qty<=LOW_STOCK_THRESHOLD;
+  return `<div class="inv-row">
+    <input type="checkbox" class="inv-select-cb" data-id="${i.id}" ${selectedInvIds.has(i.id)?'checked':''} />
+    <div><div class="inv-name">${escapeHtml(i.name)}</div>${i.dropped_off_at ? `<div class="inv-date">Dropped off ${escapeHtml(i.dropped_off_at)}</div>` : ''}</div>
+    <span class="badge ${low?'badge-low':'badge-ok'}">${low ? (i.qty<=0?'Out of stock':'Low stock') : 'In stock'}</span>
+    <div class="inv-qty">${i.qty}</div>
+    <div class="inv-actions"><button class="qty-btn" data-inv="${i.id}" data-delta="-1">−</button><button class="qty-btn" data-inv="${i.id}" data-delta="1">+</button></div></div>`;
+}
+function attachInventoryHandlers(){
+  if (actor.type!=='store') return;
+  const addInvBtn = document.getElementById('inv-add-btn');
+  if (addInvBtn){
+    addInvBtn.onclick = async () => {
+      const name = document.getElementById('inv-name').value.trim();
+      const qty = parseInt(document.getElementById('inv-qty').value, 10);
+      const droppedOffAt = document.getElementById('inv-date').value || todayStr();
+      if (!name || isNaN(qty) || qty<0){ showToast('Enter a product name and valid quantity'); return; }
+      try{
+        await api('products.php', {method:'POST', body:{name, qty, droppedOffAt}});
+        await loadStoreData();
+        showToast('Drop-off logged');
+        render();
+      }catch(e){ showToast(e.message); }
+    };
+  }
+  document.querySelectorAll('.qty-btn').forEach(btn=>{
+    btn.onclick = async () => {
+      try{
+        await api('products.php', {method:'PATCH', body:{id:parseInt(btn.dataset.inv,10), delta:parseInt(btn.dataset.delta,10)}});
+        await loadStoreData();
+        render();
+      }catch(e){ showToast(e.message); }
+    };
+  });
+  document.querySelectorAll('.inv-select-cb').forEach(cb=>{
+    cb.onchange = () => { if (cb.checked) selectedInvIds.add(parseInt(cb.dataset.id)); else selectedInvIds.delete(parseInt(cb.dataset.id)); render(); };
+  });
+  const selAll = document.getElementById('inv-select-all-cb');
+  if (selAll){ selAll.onchange = () => { if (selAll.checked) myProducts.forEach(i=>selectedInvIds.add(i.id)); else selectedInvIds.clear(); render(); }; }
+  const bulkRemove = document.getElementById('inv-bulk-remove-btn');
+  if (bulkRemove){
+    bulkRemove.onclick = async () => {
+      if (!confirm(`Remove ${selectedInvIds.size} product(s) from inventory?`)) return;
+      try{
+        await api('products.php', {method:'PATCH', body:{action:'bulk_delete', ids:Array.from(selectedInvIds)}});
+        selectedInvIds = new Set();
+        await loadStoreData();
+        showToast('Removed');
+        render();
+      }catch(e){ showToast(e.message); }
+    };
+  }
+  const bulkClear = document.getElementById('inv-bulk-clear-btn');
+  if (bulkClear) bulkClear.onclick = () => { selectedInvIds = new Set(); render(); };
+}
+function adminInventoryPanel(){
+  const storeNames = [...new Set(adminProducts.map(i=>i.store_name))].sort();
+  const invFilterStore = window._invFilterStore || 'all';
+  let invList = adminProducts.slice().sort((a,b)=> (a.store_name+a.name).localeCompare(b.store_name+b.name));
+  if (invFilterStore!=='all') invList = invList.filter(i=>i.store_name===invFilterStore);
+  return `<div class="panel"><h2><span class="dot"></span>Inventory across stores (${invList.length})</h2>
+    <div class="filters"><select id="inv-filter-store"><option value="all">All stores</option>${storeNames.map(s=>`<option value="${escapeHtml(s)}" ${s===invFilterStore?'selected':''}>${escapeHtml(s)}</option>`).join('')}</select></div>
+    ${invList.length ? invList.map(adminInvRow).join('') : '<div class="empty">No inventory logged yet.</div>'}</div>`;
+}
+function adminInvRow(i){
+  const low = i.qty<=LOW_STOCK_THRESHOLD;
+  return `<div class="inv-row"><div><div class="inv-name">${escapeHtml(i.name)} <span class="mono" style="color:var(--slate);font-size:11px;">${escapeHtml(i.store_name)}</span></div>${i.dropped_off_at?`<div class="inv-date">Dropped off ${escapeHtml(i.dropped_off_at)}</div>`:''}</div>
+    <span class="badge ${low?'badge-low':'badge-ok'}">${low ? (i.qty<=0?'Out of stock':'Low stock') : 'In stock'}</span><div class="inv-qty">${i.qty}</div><div></div><div></div></div>`;
+}
+
+/* ---------------- STORE: TEAM ---------------- */
 function storeTeamPanel(myInv, myAgentsList){
   return `
-    ${onceCred ? onceCredBox() : ''}
     <div class="panel">
       <h2><span class="dot"></span>Add a team member</h2>
       <p class="hint">Give a team member their own login. Tick what their position covers below — everything's checked by default, so they start with full access like you, minus managing the team.</p>
       <div class="row2">
         <div><label>Position / title</label><input id="agent-position" placeholder="e.g. Customer Care Agent" /></div>
-        <div><label>Password (at least 6 characters)</label><div class="pw-field"><input id="agent-password" type="password" placeholder="Set a password" /><button type="button" class="pw-toggle" data-target="agent-password">👁</button></div></div>
+        <div><label>Password (at least 6 characters)</label><div class="pw-field"><input id="agent-password" type="password" placeholder="Set a password" autocomplete="new-password" /><button type="button" class="pw-toggle" data-target="agent-password">👁</button></div></div>
       </div>
       <label>What this position handles</label>
       <div class="checklist">
         ${STORE_TEAM_PERMS.map(p=>`<label><input type="checkbox" class="agent-perm-cb" value="${p.k}" checked> ${p.label}</label>`).join('')}
-        <label><input type="checkbox" checked disabled> Wallet (view balance only) &amp; Daily Report <span style="color:var(--slate);">(always included)</span></label>
+        <label><input type="checkbox" checked disabled> Wallet (view balance only) &amp; Report <span style="color:var(--slate);">(always included)</span></label>
       </div>
       <label>Products this position is primarily responsible for <span style="text-transform:none;font-weight:400;">(for your reference — doesn't restrict access)</span></label>
       ${myInv.length ? `<div class="checklist">
@@ -719,19 +1006,46 @@ function agentRow(a){
       <button class="admin-update-btn" data-remove-agent="${a.id}">Remove</button>
     </div>`;
 }
-function invRow(i){
-  const low = i.qty<=LOW_STOCK_THRESHOLD;
-  return `<div class="inv-row"><div><div class="inv-name">${escapeHtml(i.name)}</div>${i.dropped_off_at ? `<div class="inv-date">Dropped off ${escapeHtml(i.dropped_off_at)}</div>` : ''}</div>
-    <span class="badge ${low?'badge-low':'badge-ok'}">${low ? (i.qty<=0?'Out of stock':'Low stock') : 'In stock'}</span>
-    <div class="inv-qty">${i.qty}</div>
-    <div class="inv-actions"><button class="qty-btn" data-inv="${i.id}" data-delta="-1">−</button><button class="qty-btn" data-inv="${i.id}" data-delta="1">+</button></div><div></div></div>`;
+function attachTeamHandlers(){
+  if (actor.type!=='store' || !actor.is_primary) return;
+  const agentCreateBtn = document.getElementById('agent-create-btn');
+  if (agentCreateBtn){
+    agentCreateBtn.onclick = async () => {
+      const password = document.getElementById('agent-password').value;
+      const position = document.getElementById('agent-position').value.trim();
+      const sel = Array.from(document.querySelectorAll('.agent-product-cb:checked')).map(cb=>parseInt(cb.value,10));
+      const checkedPerms = Array.from(document.querySelectorAll('.agent-perm-cb:checked')).map(cb=>cb.value);
+      if (!password || password.length < 6){ showToast('Set a password of at least 6 characters'); return; }
+      busy = true; render();
+      try{
+        const r = await api('team.php', {method:'POST', body:{password, position, product_ids:sel, permissions:checkedPerms}});
+        onceCred = {label:'Team login created — share these with your team member:', storeId:r.store_id, password:r.password};
+        await loadStoreData();
+      }catch(e){ showToast(e.message); }
+      busy = false; render();
+    };
+  }
+  document.querySelectorAll('[data-remove-agent]').forEach(btn=>{
+    btn.onclick = async () => {
+      if (!confirm('Remove this team login? They will no longer be able to log in.')) return;
+      try{
+        await api('team.php', {method:'DELETE', body:{id:parseInt(btn.dataset.removeAgent,10)}});
+        await loadStoreData();
+        showToast('Team login removed');
+        render();
+      }catch(e){ showToast(e.message); }
+    };
+  });
+  document.querySelectorAll('[data-reset-agent]').forEach(btn=>{
+    btn.onclick = () => {
+      const agent = myAgents.find(a=>a.id === parseInt(btn.dataset.resetAgent,10));
+      resetPwTarget = {kind:'agent', id: agent.id, label: 'Team login ' + agent.store_id};
+      render();
+    };
+  });
 }
-function storeHistoryPanel(mine){
-  return `<div class="panel"><h2><span class="dot"></span>Your orders</h2>
-    ${dateFilterBar('_historyDateQuick')}
-    ${mine.length ? mine.slice().sort((a,b)=>b.createdAt-a.createdAt).map(stubCard).join('') : '<div class="empty">No orders in this range.</div>'}
-  </div>`;
-}
+
+/* ---------------- STORE: WALLET ---------------- */
 function storeWalletPanel(){
   const balance = myWallet.balance || 0;
   const hasBank = myBank.bankName && myBank.accountNumber && myBank.accountName;
@@ -739,7 +1053,7 @@ function storeWalletPanel(){
   return `
     <div class="panel">
       <h2><span class="dot"></span>Wallet</h2>
-      <p class="hint">Your balance updates automatically the moment an order is marked Delivered — the amount collected, minus delivery charges, lands here.</p>
+      <p class="hint">Your balance updates automatically the moment an order is marked Delivered (and stays counted once it's Remitted) — the amount collected, minus delivery charges, lands here.</p>
       <div class="stat" style="cursor:default;min-width:200px;"><div class="n">${money(balance)}</div><div class="l">Available balance</div></div>
     </div>
     ${actor.is_primary ? `
@@ -774,154 +1088,8 @@ function storeWalletPanel(){
         </div>`).join('') : '<div class="empty">No withdrawal requests yet.</div>'}
     </div>`;
 }
-function sentReportPopup(pending){
-  return `<div class="modal-overlay" id="sentreport-overlay"><div class="modal">
-    <h3>Your dispatch team sent a report</h3>
-    <div class="id">${pending.length} report${pending.length>1?'s':''} ready for you to review</div>
-    ${pending.map(r=>`<div class="new-order-item">📅 ${escapeHtml(formatDateRangeLabel(r.dateFrom, r.dateTo))} — sent ${new Date(r.sentAt).toLocaleString()}. Open the Daily Report tab to see the full breakdown.</div>`).join('')}
-    <div class="modal-actions"><button class="btn" id="sentreport-ack-btn">Got it</button></div>
-    </div></div>`;
-}
-function stubCard(o){
-  const sm = statusMeta(o.status);
-  const dCharge = (o.deliveryFee||0)+(o.otherCharges||0);
-  return `<div class="stub"><div class="stub-top"><div><div class="stub-id mono">#${escapeHtml(o.id)}</div><div class="stub-item">${escapeHtml(o.item)}${o.qty>1?' × '+o.qty:''}</div></div><span class="badge ${sm.badge}">${sm.label}</span></div>
-    <div class="stub-grid"><div><span class="k">Customer:</span> ${escapeHtml(o.customer)} · ${escapeHtml(o.phone)}${o.altPhone?' / '+escapeHtml(o.altPhone):''}</div><div><span class="k">Deliver to:</span> ${escapeHtml(o.dropoff)}</div></div>
-    ${o.notes ? `<div class="stub-remark"><span class="k">Instructions:</span> ${escapeHtml(o.notes)}</div>` : ''}
-    ${o.remark ? `<div class="stub-remark"><span class="k">Dispatch note:</span> ${escapeHtml(o.remark)}</div>` : ''}
-    <div class="stub-charges">
-      ${o.amount ? `<span>Amount: <b>${money(o.amount)}</b></span>` : ''}
-      ${dCharge ? `<span>Delivery charge: <b>${money(dCharge)}</b></span>` : ''}
-      ${o.amount || dCharge ? `<span>Balance: <b>${money((o.amount||0)-dCharge)}</b></span>` : ''}
-    </div>
-    <div class="stub-meta">Submitted ${new Date(o.createdAt).toLocaleString()}${o.rider ? ' · Rider: '+escapeHtml(o.rider) : ''}${o.lastUpdatedBy ? ' · Last updated by '+escapeHtml(o.lastUpdatedBy) : ''}</div></div>`;
-}
-async function reloadStoreHistoryWithDate(){
-  const perms = storePerms();
-  if (!perms.history) return;
-  const params = new URLSearchParams();
-  if (window._historyDateFrom) params.set('date_from', window._historyDateFrom);
-  if (window._historyDateTo) params.set('date_to', window._historyDateTo);
-  const r = await api('orders.php?' + params.toString());
-  myOrders = r.orders;
-}
-function attachStoreHandlers(){
-  attachHeaderHandlers();
-  attachPasswordToggles();
-  attachGreetingHandler();
-  attachPasswordChangeHandlers();
-  attachReportHandlers(false);
-  document.querySelectorAll('.tab-btn[data-tab]').forEach(btn=>{
-    btn.onclick = async () => {
-      storeTab = btn.dataset.tab; onceCred=null; render();
-      if (storeTab === 'wallet'){ try{ await loadWalletData(); render(); }catch(e){ showToast(e.message); } }
-      if (storeTab === 'report'){ try{ await loadReportData(null, ''); render(); }catch(e){ showToast(e.message); } }
-    };
-  });
-  document.querySelectorAll('[data-quickdate]').forEach(btn=>{
-    btn.onclick = async () => {
-      const key = btn.dataset.quickkey;
-      window[key] = btn.dataset.quickdate;
-      const {from, to} = quickRangeDates(btn.dataset.quickdate);
-      if (key === '_historyDateQuick'){
-        window._historyDateFrom = from; window._historyDateTo = to;
-        try{ await reloadStoreHistoryWithDate(); render(); }catch(e){ showToast(e.message); }
-      }
-    };
-  });
-  const gotoInvBtn = document.getElementById('goto-inventory-btn');
-  if (gotoInvBtn) gotoInvBtn.onclick = () => { storeTab='inventory'; render(); };
-
-  const submitBtn = document.getElementById('submit-order-btn');
-  if (submitBtn){
-    submitBtn.onclick = async () => {
-      const productId = parseInt(document.getElementById('f-product').value, 10);
-      const customer = document.getElementById('f-customer').value.trim();
-      const phone = document.getElementById('f-phone').value.trim();
-      const altPhone = document.getElementById('f-altphone').value.trim();
-      const dropoff = document.getElementById('f-dropoff').value.trim();
-      const notes = document.getElementById('f-notes').value.trim();
-      const amount = parseFloat(document.getElementById('f-amount').value) || 0;
-      const qty = parseInt(document.getElementById('f-qty').value, 10) || 1;
-      if (!productId || !customer || !phone || !dropoff){ showToast('Fill in name, product, address and phone number'); return; }
-      if (qty < 1){ showToast('Quantity must be at least 1'); return; }
-      busy = true; render();
-      try{
-        await api('orders.php', {method:'POST', body:{product_id:productId, customer, phone, altPhone, dropoff, notes, amount, qty}});
-        await loadStoreData();
-        showToast('Order submitted — stock updated');
-      }catch(e){ showToast(e.message); }
-      busy = false; render();
-    };
-  }
-  const addInvBtn = document.getElementById('inv-add-btn');
-  if (addInvBtn){
-    addInvBtn.onclick = async () => {
-      const name = document.getElementById('inv-name').value.trim();
-      const qty = parseInt(document.getElementById('inv-qty').value, 10);
-      const droppedOffAt = document.getElementById('inv-date').value || todayStr();
-      if (!name || isNaN(qty) || qty<0){ showToast('Enter a product name and valid quantity'); return; }
-      try{
-        await api('products.php', {method:'POST', body:{name, qty, droppedOffAt}});
-        await loadStoreData();
-        showToast('Drop-off logged');
-        render();
-      }catch(e){ showToast(e.message); }
-    };
-  }
-  document.querySelectorAll('.qty-btn').forEach(btn=>{
-    btn.onclick = async () => {
-      try{
-        await api('products.php', {method:'PATCH', body:{id:parseInt(btn.dataset.inv,10), delta:parseInt(btn.dataset.delta,10)}});
-        await loadStoreData();
-        render();
-      }catch(e){ showToast(e.message); }
-    };
-  });
-  const agentCreateBtn = document.getElementById('agent-create-btn');
-  if (agentCreateBtn){
-    agentCreateBtn.onclick = async () => {
-      const password = document.getElementById('agent-password').value;
-      const position = document.getElementById('agent-position').value.trim();
-      const sel = Array.from(document.querySelectorAll('.agent-product-cb:checked')).map(cb=>parseInt(cb.value,10));
-      const checkedPerms = Array.from(document.querySelectorAll('.agent-perm-cb:checked')).map(cb=>cb.value);
-      if (!password || password.length < 6){ showToast('Set a password of at least 6 characters'); return; }
-      busy = true; render();
-      try{
-        const r = await api('team.php', {method:'POST', body:{password, position, product_ids:sel, permissions:checkedPerms}});
-        onceCred = {label:'Team login created — share these with your team member:', storeId:r.store_id, password:r.password};
-        await loadStoreData();
-      }catch(e){ showToast(e.message); }
-      busy = false; render();
-    };
-  }
-  const onceDismiss = document.getElementById('once-cred-dismiss');
-  if (onceDismiss) onceDismiss.onclick = () => { onceCred = null; render(); };
-
-  document.querySelectorAll('[data-remove-agent]').forEach(btn=>{
-    btn.onclick = async () => {
-      if (!confirm('Remove this team login? They will no longer be able to log in.')) return;
-      try{
-        await api('team.php', {method:'DELETE', body:{id:parseInt(btn.dataset.removeAgent,10)}});
-        await loadStoreData();
-        showToast('Team login removed');
-        render();
-      }catch(e){ showToast(e.message); }
-    };
-  });
-  document.querySelectorAll('[data-reset-agent]').forEach(btn=>{
-    btn.onclick = () => {
-      const agent = myAgents.find(a=>a.id === parseInt(btn.dataset.resetAgent,10));
-      resetPwTarget = {kind:'agent', id: agent.id, label: 'Team login ' + agent.store_id};
-      render();
-    };
-  });
-  attachResetPasswordModalHandlers(async (newPassword) => {
-    const r = await api('team.php', {method:'PATCH', body:{id: resetPwTarget.id, new_password: newPassword}});
-    onceCred = {label:'New password set — share it with your team member:', storeId: myAgents.find(a=>a.id===resetPwTarget.id).store_id, password:r.new_password};
-    resetPwTarget = null;
-  });
-
+function attachWalletHandlers(){
+  if (actor.type!=='store') return;
   const bankSaveBtn = document.getElementById('bank-save-btn');
   if (bankSaveBtn){
     bankSaveBtn.onclick = async () => {
@@ -950,21 +1118,38 @@ function attachStoreHandlers(){
       }catch(e){ showToast(e.message); }
     };
   }
-  const sentReportOverlay = document.getElementById('sentreport-overlay');
-  if (sentReportOverlay){
-    document.getElementById('sentreport-ack-btn').onclick = async () => {
-      try{ await api('sent-reports.php', {method:'POST', body:{action:'ack'}}); mySentReports = []; reportPopupOpen = false; render(); }
-      catch(e){ showToast(e.message); }
-    };
-  }
+}
+function sentReportPopup(pending){
+  return `<div class="modal-overlay" id="sentreport-overlay"><div class="modal">
+    <h3>Your dispatch team sent a report</h3>
+    <div class="id">${pending.length} report${pending.length>1?'s':''} ready for you to review</div>
+    ${pending.map(r=>`<div class="new-order-item">📅 ${escapeHtml(formatDateRangeLabel(r.dateFrom, r.dateTo))} — sent ${new Date(r.sentAt).toLocaleString()}. Open the Report section to see the full breakdown.</div>`).join('')}
+    <div class="modal-actions"><button class="btn" id="sentreport-ack-btn">Got it</button></div>
+    </div></div>`;
+}
+function lowStockPopup(){
+  const low = myProducts.filter(i=>i.qty<=POPUP_LOW_STOCK_THRESHOLD);
+  return `<div class="modal-overlay" id="lowstock-overlay"><div class="modal">
+    <h3>⚠ Time to restock</h3><div class="id">${low.length} product(s) are running low</div>
+    ${low.map(i=>`<div class="new-order-item">${escapeHtml(i.name)} — only ${i.qty} left</div>`).join('')}
+    <div class="modal-actions"><button class="btn btn-outline" id="lowstock-close">Dismiss</button><button class="btn" id="lowstock-goto">Go to Inventory</button></div>
+  </div></div>`;
 }
 
-/* ---------------- REPORT (shared store + admin) ---------------- */
+/* ---------------- REPORT (shared store + admin, day-grouped w/ drill-down) ---------------- */
 function formatDateRangeLabel(from, to){
   if (!from && !to) return 'All time — no date limit';
   const fmt = (s) => { const d = new Date(s+'T00:00:00'); return d.toLocaleDateString('en-US', {month:'long', day:'numeric', year:'numeric'}); };
   if (from===to) return fmt(from);
   return fmt(from) + ' – ' + fmt(to);
+}
+function reportDayGroups(rows){
+  const byDay = {};
+  rows.forEach(r=>{
+    if (!byDay[r.date]) byDay[r.date] = {date:r.date, count:0, balance:0};
+    byDay[r.date].count++; byDay[r.date].balance += r.balance;
+  });
+  return Object.values(byDay).sort((a,b)=>b.date.localeCompare(a.date));
 }
 function reportPanel(isAdmin, storeNames){
   if (window._reportDateFrom === undefined){
@@ -974,144 +1159,306 @@ function reportPanel(isAdmin, storeNames){
   const q = window._reportDateQuick || 'today';
   const rows = reportData.rows || [];
   const totals = reportData.totals || {amount:0, charge:0, balance:0};
+  const isSingleDay = (q==='today') || (window._reportDateFrom && window._reportDateFrom===window._reportDateTo);
+  const showDayList = !isSingleDay && !reportDrillDay;
+  const dayGroups = showDayList ? reportDayGroups(rows) : [];
+  const detailRows = showDayList ? [] : (reportDrillDay ? rows.filter(r=>r.date===reportDrillDay) : rows);
+  const searchTerm = (window._reportSearch||'').toLowerCase();
+  const visibleRows = searchTerm ? detailRows.filter(o=>o.customer.toLowerCase().includes(searchTerm)||(o.phone||'').toLowerCase().includes(searchTerm)) : detailRows;
+  const detailTotals = showDayList ? totals : visibleRows.reduce((acc,o)=>({amount:acc.amount+o.amount, charge:acc.charge+o.charge, balance:acc.balance+o.balance}), {amount:0,charge:0,balance:0});
+
   return `<div class="panel">
     <h2><span class="dot"></span>Report ${reportData.store?'— '+escapeHtml(reportData.store):''}</h2>
     <div style="font-size:14px;font-weight:800;color:var(--ink);margin-bottom:12px;">📅 ${formatDateRangeLabel(window._reportDateFrom, window._reportDateTo)}</div>
     <p class="hint">Grouped by the day each order was last resolved (e.g. delivered), not the day it was placed — so orders dropped off earlier still show up on the day they were actually completed.</p>
     <div class="filters">
       ${isAdmin ? `<select id="report-store-select">${(storeNames||[]).map(s=>`<option value="${escapeHtml(s.store_id)}" ${s.store_id===window._reportStoreId?'selected':''}>${escapeHtml(s.store_name)}</option>`).join('')}</select>` : ''}
-      <input id="report-search" placeholder="Search customer or phone" value="${escapeHtml(window._reportSearch||'')}" />
       <div class="quickdate">
         <button data-reportquick="today" class="${q==='today'?'active':''}">Today</button>
         <button data-reportquick="week" class="${q==='week'?'active':''}">This week</button>
         <button data-reportquick="month" class="${q==='month'?'active':''}">This month</button>
         <button data-reportquick="all" class="${q==='all'?'active':''}">All time</button>
+        <span style="font-size:11px;color:var(--slate);margin-left:2px;">or:</span>
+        <input type="date" id="report-custom-from" value="${window._reportDateFrom||''}" style="width:auto;margin-bottom:0;">
+        <span style="font-size:11px;color:var(--slate);">to</span>
+        <input type="date" id="report-custom-to" value="${window._reportDateTo||''}" style="width:auto;margin-bottom:0;">
+        <button class="btn btn-sm" id="report-custom-apply">Apply</button>
       </div>
     </div>
-    ${rows.length ? `<div style="overflow-x:auto;"><table class="report">
-      <thead><tr><th>Customer</th><th>Product</th><th>Address</th><th>Status</th><th>Amount</th><th>Delivery charge</th><th>Balance</th></tr></thead>
-      <tbody>${rows.map(o=>`<tr><td>${escapeHtml(o.customer)}</td><td>${escapeHtml(o.item)}${o.qty>1?' × '+o.qty:''}</td><td>${escapeHtml(o.dropoff)}</td>
-        <td><span class="badge ${statusMeta(o.status).badge}">${statusMeta(o.status).label}</span></td>
-        <td>${o.amount?money(o.amount):'—'}</td><td>${o.charge?money(o.charge):'—'}</td><td><b>${money(o.balance)}</b></td></tr>`).join('')}</tbody>
-      <tfoot><tr><td colspan="4">Totals</td><td>${money(totals.amount)}</td><td>${money(totals.charge)}</td><td>${money(totals.balance)}</td></tr></tfoot>
-    </table></div>` : '<div class="empty">No orders in this range.</div>'}
-    ${isAdmin && reportData.store ? `<div style="margin-top:18px;"><button class="btn" id="send-report-btn">Send this report to ${escapeHtml(reportData.store)}</button></div>` : ''}
+    ${!showDayList && reportDrillDay ? `<div style="margin-bottom:14px;"><a href="#" id="report-back-to-days" style="font-size:12px;color:var(--blue);">← Back to day list</a></div>` : ''}
+    ${!showDayList ? `<div class="filters"><input id="report-search" placeholder="Search customer or phone" value="${escapeHtml(window._reportSearch||'')}" /><button class="btn-outline btn" id="report-search-btn" style="padding:9px 14px;">Search</button></div>` : ''}
+    ${showDayList ? (
+      dayGroups.length ? dayGroups.map(g=>`<div class="day-row" data-drillday="${g.date}"><div><div class="dlabel">${escapeHtml(formatDateRangeLabel(g.date,g.date))}</div><div class="dcount">${g.count} order${g.count===1?'':'s'}</div></div><div class="dbal">${money(g.balance)}</div></div>`).join('') : '<div class="empty">No orders in this range.</div>'
+    ) : (
+      visibleRows.length ? `<div style="overflow-x:auto;"><table class="report">
+        <thead><tr><th>Customer</th><th>Product</th><th>Address</th><th>Status</th><th>Amount</th><th>Delivery charge</th><th>Balance</th></tr></thead>
+        <tbody>${visibleRows.map(o=>`<tr><td>${escapeHtml(o.customer)}</td><td>${escapeHtml(o.item)}${o.qty>1?' × '+o.qty:''}</td><td>${escapeHtml(o.dropoff)}</td>
+          <td><span class="badge ${statusMeta(o.status).badge}">${statusMeta(o.status).label}</span></td>
+          <td>${o.amount?money(o.amount):'—'}</td><td>${o.charge?money(o.charge):'—'}</td><td><b>${money(o.balance)}</b></td></tr>`).join('')}</tbody>
+        <tfoot><tr><td colspan="4">Totals</td><td>${money(detailTotals.amount)}</td><td>${money(detailTotals.charge)}</td><td>${money(detailTotals.balance)}</td></tr></tfoot>
+      </table></div>` : '<div class="empty">No orders in this range.</div>'
+    )}
+    ${isAdmin && reportData.store ? `<div style="margin-top:18px;"><button class="btn" id="send-report-btn">Send this report to ${escapeHtml(reportData.store)}</button><p class="hint" style="margin-top:8px;">This marks every Delivered order in this range as Remitted, and notifies ${escapeHtml(reportData.store)} next time they log in.</p></div>` : ''}
   </div>`;
 }
 function attachReportHandlers(isAdmin){
+  const goReload = async () => {
+    try{ await loadReportData(isAdmin ? window._reportStoreId : null, window._reportSearch); reportDrillDay=null; render(); }
+    catch(e){ showToast(e.message); }
+  };
   document.querySelectorAll('[data-reportquick]').forEach(btn=>{
     btn.onclick = async () => {
       window._reportDateQuick = btn.dataset.reportquick;
       const {from, to} = quickRangeDates(btn.dataset.reportquick);
       window._reportDateFrom = from; window._reportDateTo = to;
-      try{ await loadReportData(isAdmin ? window._reportStoreId : null, window._reportSearch); render(); }
-      catch(e){ showToast(e.message); }
+      await goReload();
     };
   });
+  const customApply = document.getElementById('report-custom-apply');
+  if (customApply){
+    customApply.onclick = async () => {
+      window._reportDateFrom = document.getElementById('report-custom-from').value;
+      window._reportDateTo = document.getElementById('report-custom-to').value;
+      window._reportDateQuick = 'custom';
+      await goReload();
+    };
+  }
   const storeSelect = document.getElementById('report-store-select');
   if (storeSelect){
-    storeSelect.onchange = async (e) => {
-      window._reportStoreId = e.target.value;
-      try{ await loadReportData(window._reportStoreId, window._reportSearch); render(); }
-      catch(e){ showToast(e.message); }
-    };
+    storeSelect.onchange = async (e) => { window._reportStoreId = e.target.value; await goReload(); };
   }
   const search = document.getElementById('report-search');
   if (search){
     search.oninput = e => { window._reportSearch = e.target.value; };
-    search.addEventListener('keydown', async e => {
-      if (e.key==='Enter'){
-        try{ await loadReportData(isAdmin ? window._reportStoreId : null, window._reportSearch); render(); }
-        catch(err){ showToast(err.message); }
-      }
-    });
+    search.addEventListener('keydown', e => { if (e.key==='Enter') render(); });
   }
+  const searchBtn = document.getElementById('report-search-btn');
+  if (searchBtn) searchBtn.onclick = () => render();
+  document.querySelectorAll('[data-drillday]').forEach(row=>{
+    row.onclick = () => { reportDrillDay = row.dataset.drillday; render(); };
+  });
+  const backLink = document.getElementById('report-back-to-days');
+  if (backLink) backLink.onclick = (e) => { e.preventDefault(); reportDrillDay = null; render(); };
   const sendBtn = document.getElementById('send-report-btn');
   if (sendBtn){
     sendBtn.onclick = async () => {
       const range = window._reportDateQuick || 'today';
-      const label = range==='today' ? 'Today' : range==='week' ? 'This week' : range==='month' ? 'This month' : 'All time';
+      const label = range==='today' ? 'Today' : range==='week' ? 'This week' : range==='month' ? 'This month' : range==='custom' ? 'Custom range' : 'All time';
       try{
         await api('report.php', {method:'POST', body:{store_id: window._reportStoreId, range_label: label, date_from: window._reportDateFrom, date_to: window._reportDateTo}});
         showToast(`Report sent to ${reportData.store}`);
+        await goReload();
       }catch(e){ showToast(e.message); }
     };
   }
 }
 
-/* ---------------- ADMIN ---------------- */
-function adminScreen(){
-  const perms = actor.permissions || {};
-  const tabs = ADMIN_PERMS.filter(t=>perms[t.k]).concat([{k:'report', label:'Report'}]);
-  if (!tabs.find(t=>t.k===adminTab)) adminTab = tabs[0].k;
-
-  return `
-    ${header()}
-    ${greetingBanner()}
-    <div class="tabs">${tabs.map(t=>`<button class="tab-btn ${adminTab===t.k?'active':''}" data-admintab="${t.k}">${t.label}</button>`).join('')}</div>
-    ${adminTab==='orders' && perms.orders ? adminOrdersPanel() : ''}
-    ${adminTab==='inventory' && perms.inventory ? adminInventoryPanel() : ''}
-    ${adminTab==='stores' && perms.stores ? adminStoresPanel() : ''}
-    ${adminTab==='team' && perms.team ? adminTeamPanel() : ''}
-    ${adminTab==='withdrawals' && perms.withdrawals ? adminWithdrawalsPanel() : ''}
-    ${adminTab==='expenses' && perms.expenses ? adminExpensesPanel() : ''}
-    ${adminTab==='report' ? reportPanel(true, reportData.storeOptions || []) : ''}
-    ${modalOrder ? updateModal(modalOrder) : ''}
-    ${popupOpen ? newOrdersPopup(unseenOrders) : ''}
-    ${pwChangeOpen ? passwordChangeModal() : ''}
-    ${onceCred ? onceCredBox() : ''}
-    ${resetPwTarget && (resetPwTarget.kind==='store'||resetPwTarget.kind==='admin') ? resetPasswordModal() : ''}
-  `;
+/* ---------------- ADMIN: ORDERS ---------------- */
+function csvEscape(v){ v=String(v==null?'':v); if(/[",\n]/.test(v)) return '"'+v.replace(/"/g,'""')+'"'; return v; }
+function exportOrdersCsv(list){
+  const headers=['Order ID','Store','Product','Qty','Customer','Phone','Address','Status','Amount','Delivery Fee','Other Charges','Balance','Created','Updated'];
+  const rows=list.map(o=>[o.id,o.store,o.item,o.qty,o.customer,o.phone,o.dropoff,statusMeta(o.status).label,o.amount||0,o.deliveryFee||0,o.otherCharges||0,(o.amount||0)-((o.deliveryFee||0)+(o.otherCharges||0)),new Date(o.createdAt).toLocaleString(),new Date(o.updatedAt).toLocaleString()]);
+  const csv=[headers,...rows].map(r=>r.map(csvEscape).join(',')).join('\n');
+  const blob=new Blob([csv],{type:'text/csv'});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a'); a.href=url; a.download='orders-'+todayStr()+'.csv'; a.click();
+  URL.revokeObjectURL(url);
 }
-async function reloadAdminOrdersWithDate(){
-  const params = new URLSearchParams();
-  if (window._filterStore && window._filterStore !== 'all') params.set('store_id', window._filterStore);
-  if (window._ordersDateFrom) params.set('date_from', window._ordersDateFrom);
-  if (window._ordersDateTo) params.set('date_to', window._ordersDateTo);
-  const r = await api('orders.php?' + params.toString());
-  adminOrders = r.orders;
-}
-function adminOrdersPanel(){
+function adminOrdersSection(){
   const storeOptions = adminAccounts.filter(a=>a.role==='owner').slice().sort((a,b)=>a.store_name.localeCompare(b.store_name));
   const filterStore = window._filterStore || 'all';
-  const filterStatus = window._filterStatus || 'all';
   const searchTerm = (window._searchTerm || '').toLowerCase();
   let list = adminOrders.slice().sort((a,b)=>b.createdAt-a.createdAt);
+  const filterStatus = window._filterStatus || 'all';
   if (filterStatus!=='all') list = list.filter(o=>o.status===filterStatus);
   if (searchTerm) list = list.filter(o=>
     o.customer.toLowerCase().includes(searchTerm) || o.phone.toLowerCase().includes(searchTerm) || o.id.toLowerCase().includes(searchTerm)
   );
-  const counts = {}; STATUSES.forEach(s=>counts[s.v]=0);
-  adminOrders.forEach(o=>counts[o.status]=(counts[o.status]||0)+1);
   const lowStockAll = adminProducts.filter(i=>i.qty<=LOW_STOCK_THRESHOLD);
 
   return `
     ${lowStockAll.length ? `<div class="alert-banner">⚠ ${lowStockAll.length} product${lowStockAll.length>1?'s':''} low or out of stock: ${lowStockAll.map(i=>escapeHtml(i.store_name)+' — '+escapeHtml(i.name)+' ('+i.qty+')').join(', ')}</div>` : ''}
-    <div class="stat-row">
-      <div class="stat ${filterStatus==='all'?'active':''}" data-statfilter="all"><div class="n">${adminOrders.length}</div><div class="l">Total orders</div></div>
-      ${STATUSES.map(s=>`<div class="stat ${filterStatus===s.v?'active':''}" data-statfilter="${s.v}"><div class="n">${counts[s.v]}</div><div class="l">${s.label}</div></div>`).join('')}
-    </div>
     <div class="panel">
       <h2><span class="dot"></span>All orders (${list.length})</h2>
-      ${dateFilterBar('_ordersDateQuick')}
+      ${statusPillRow(list, adminOrders, '_filterStatus')}
       <div class="filters">
         <input id="search-orders" placeholder="Search customer, phone, or order #" value="${escapeHtml(window._searchTerm||'')}" />
-        <button class="btn-outline btn" id="search-btn" style="padding:10px 16px;">Search</button>
+        <button class="btn-outline btn" id="search-btn" style="padding:9px 14px;">Search</button>
         <select id="filter-store"><option value="all">All stores</option>${storeOptions.map(s=>`<option value="${escapeHtml(s.store_id)}" ${s.store_id===filterStore?'selected':''}>${escapeHtml(s.store_name)}</option>`).join('')}</select>
-        <select id="filter-status"><option value="all">All statuses</option>${STATUSES.map(s=>`<option value="${s.v}" ${s.v===filterStatus?'selected':''}>${s.label}</option>`).join('')}</select>
+        <button class="btn-outline btn" id="export-csv-btn" style="padding:9px 14px;">Export CSV</button>
       </div>
+      ${dateFilterBar('_ordersDateQuick')}
+      <label style="display:flex;align-items:center;gap:8px;text-transform:none;font-weight:400;font-size:12.5px;margin-bottom:10px;">
+        <input type="checkbox" id="select-all-cb" style="width:auto;margin:0;" ${list.length && list.every(o=>selectedOrderIds.has(o.id))?'checked':''}> Select all shown
+      </label>
+      ${selectedOrderIds.size?bulkBar(true):''}
       ${list.length ? list.map(adminRow).join('') : '<div class="empty">No orders match this filter.</div>'}
     </div>`;
 }
-function adminInventoryPanel(){
-  const storeNames = [...new Set(adminProducts.map(i=>i.store_name))].sort();
-  const invFilterStore = window._invFilterStore || 'all';
-  let invList = adminProducts.slice().sort((a,b)=> (a.store_name+a.name).localeCompare(b.store_name+b.name));
-  if (invFilterStore!=='all') invList = invList.filter(i=>i.store_name===invFilterStore);
-  return `<div class="panel"><h2><span class="dot"></span>Inventory across stores (${invList.length})</h2>
-    <div class="filters"><select id="inv-filter-store"><option value="all">All stores</option>${storeNames.map(s=>`<option value="${escapeHtml(s)}" ${s===invFilterStore?'selected':''}>${escapeHtml(s)}</option>`).join('')}</select></div>
-    ${invList.length ? invList.map(adminInvRow).join('') : '<div class="empty">No inventory logged yet.</div>'}</div>`;
+function adminRow(o){
+  const sm = statusMeta(o.status);
+  const total = (o.deliveryFee||0)+(o.otherCharges||0);
+  const canRestock = (o.status==='cancelled' || o.status==='issue' || o.status==='returned') && !o.restocked;
+  return `<div class="admin-row" style="grid-template-columns:auto auto 1.3fr auto auto auto auto;">
+    <input type="checkbox" class="order-select-cb" data-id="${escapeHtml(o.id)}" ${selectedOrderIds.has(o.id)?'checked':''} style="width:auto;margin:0;transform:scale(1.2);" />
+    <div class="admin-store">${escapeHtml(o.store)}</div>
+    <div class="admin-main"><div class="item">${escapeHtml(o.item)}${o.qty>1?' × '+o.qty:''} <span class="mono" style="color:var(--slate);font-size:11px;">#${escapeHtml(o.id)}</span></div>
+    <div class="sub">${escapeHtml(o.customer)} · ${escapeHtml(o.phone)}${o.altPhone?' / '+escapeHtml(o.altPhone):''} — to ${escapeHtml(o.dropoff)}${o.lastUpdatedBy?' · by '+escapeHtml(o.lastUpdatedBy):''}</div></div>
+    <span class="badge ${sm.badge}">${sm.label}</span>
+    <div class="admin-charges">${total ? `<b>${money(total)}</b>` : '—'}</div>
+    <div>${canRestock ? `<button class="restock-btn" data-restock="${escapeHtml(o.id)}">Restock</button>` : (o.restocked ? '<span style="font-size:10px;color:var(--slate);">restocked</span>' : '')}</div>
+    <div style="display:flex;gap:6px;">
+      <button class="admin-update-btn" data-id="${escapeHtml(o.id)}">Update</button>
+      <button class="danger-btn" data-admin-trash="${escapeHtml(o.id)}">Trash</button>
+    </div></div>`;
 }
+function updateModal(o){
+  return `<div class="modal-overlay" id="modal-overlay"><div class="modal">
+    <h3>${escapeHtml(o.item)}${o.qty>1?' × '+o.qty:''}</h3><div class="id mono">#${escapeHtml(o.id)} · ${escapeHtml(o.store)}</div>
+    <label>Status</label><select id="modal-status">${STATUSES.map(s=>`<option value="${s.v}" ${s.v===o.status?'selected':''}>${s.label}</option>`).join('')}</select>
+    <label>Rider / driver (optional)</label><input id="modal-rider" value="${escapeHtml(o.rider||'')}" placeholder="e.g. Tunde" />
+    <div class="row2"><div><label>Delivery fee</label><input id="modal-delivery-fee" type="number" min="0" value="${o.deliveryFee||0}" /></div>
+    <div><label>Other charges</label><input id="modal-other-charges" type="number" min="0" value="${o.otherCharges||0}" /></div></div>
+    <label>Charge note</label><input id="modal-charge-note" value="${escapeHtml(o.chargeNote||'')}" placeholder="e.g. Failed delivery fee" />
+    <label>Dispatch note</label><textarea id="modal-remark" rows="3">${escapeHtml(o.remark||'')}</textarea>
+    <div class="modal-actions"><button class="btn btn-outline" id="modal-cancel">Cancel</button><button class="btn" id="modal-save" ${busy?'disabled':''}>${busy?'<span class="spinner-inline"></span>':'Save update'}</button></div>
+    </div></div>`;
+}
+function newOrdersPopup(list){
+  return `<div class="modal-overlay" id="popup-overlay"><div class="modal">
+    <h3>${list.length ? 'New orders waiting' : "You're all caught up"}</h3>
+    <div class="id">${list.length ? list.length + ' order' + (list.length>1?'s':'') + ' need attention' : 'No unseen orders'}</div>
+    ${list.slice(0,12).map(o=>`<div class="new-order-item"><span class="store-tag">${escapeHtml(o.store)}</span>${escapeHtml(o.item)} — ${escapeHtml(o.customer)} · ${escapeHtml(o.phone)}</div>`).join('')}
+    <div class="modal-actions"><button class="btn btn-outline" id="popup-close">Close</button>${list.length ? '<button class="btn" id="popup-mark-seen">Mark all as seen</button>' : ''}</div>
+    </div></div>`;
+}
+function attachOrdersHandlers(){
+  attachStatusPillHandlers();
+  if (actor.type==='store'){
+    attachDateFilterHandlers('_historyDateQuick', reloadStoreOrdersWithDate);
+    const gotoInvBtn = document.getElementById('goto-inventory-btn');
+    if (gotoInvBtn) gotoInvBtn.onclick = () => { activeSection='inventory'; render(); };
+
+    const submitBtn = document.getElementById('submit-order-btn');
+    if (submitBtn){
+      submitBtn.onclick = async () => {
+        const productId = parseInt(document.getElementById('f-product').value, 10);
+        const customer = document.getElementById('f-customer').value.trim();
+        const phone = document.getElementById('f-phone').value.trim();
+        const altPhone = document.getElementById('f-altphone').value.trim();
+        const dropoff = document.getElementById('f-dropoff').value.trim();
+        const notes = document.getElementById('f-notes').value.trim();
+        const amount = parseFloat(document.getElementById('f-amount').value) || 0;
+        const qty = parseInt(document.getElementById('f-qty').value, 10) || 1;
+        if (!productId || !customer || !phone || !dropoff){ showToast('Fill in name, product, address and phone number'); return; }
+        if (qty < 1){ showToast('Quantity must be at least 1'); return; }
+        busy = true; render();
+        try{
+          await api('orders.php', {method:'POST', body:{product_id:productId, customer, phone, altPhone, dropoff, notes, amount, qty}});
+          await loadStoreData();
+          showToast('Order submitted — stock updated');
+        }catch(e){ showToast(e.message); }
+        busy = false; render();
+      };
+    }
+    const search = document.getElementById('search-history');
+    if (search){ search.oninput = e=>{ window._historySearch = e.target.value; }; search.addEventListener('keydown', e=>{ if (e.key==='Enter') render(); }); }
+    const searchBtn = document.getElementById('search-history-btn');
+    if (searchBtn) searchBtn.onclick = () => render();
+
+    document.querySelectorAll('[data-store-trash]').forEach(btn=>{
+      btn.onclick = async () => {
+        try{
+          await api('orders.php', {method:'PATCH', body:{action:'trash', id:btn.dataset.storeTrash}});
+          selectedOrderIds.delete(btn.dataset.storeTrash);
+          await reloadStoreOrdersWithDate();
+          showToast('Moved to Trash');
+          render();
+        }catch(e){ showToast(e.message); }
+      };
+    });
+  } else {
+    attachDateFilterHandlers('_ordersDateQuick', reloadAdminOrdersWithDate);
+    const fs = document.getElementById('filter-store');
+    const search = document.getElementById('search-orders');
+    if (fs) fs.onchange = async e => { window._filterStore = e.target.value; try{ await reloadAdminOrdersWithDate(); render(); }catch(err){ showToast(err.message); } };
+    if (search){ search.oninput = e => { window._searchTerm = e.target.value; }; search.addEventListener('keydown', e=>{ if (e.key==='Enter'){ render(); } }); }
+    const searchBtn = document.getElementById('search-btn');
+    if (searchBtn) searchBtn.onclick = () => render();
+    const exportBtn = document.getElementById('export-csv-btn');
+    if (exportBtn) exportBtn.onclick = () => exportOrdersCsv(adminOrders.slice().sort((a,b)=>b.createdAt-a.createdAt).filter(o=>{
+      const filterStatus = window._filterStatus||'all';
+      const searchTerm = (window._searchTerm||'').toLowerCase();
+      if (filterStatus!=='all' && o.status!==filterStatus) return false;
+      if (searchTerm && !(o.customer.toLowerCase().includes(searchTerm)||o.phone.toLowerCase().includes(searchTerm)||o.id.toLowerCase().includes(searchTerm))) return false;
+      return true;
+    }));
+
+    document.querySelectorAll('.admin-update-btn[data-id]').forEach(btn=>{
+      btn.onclick = () => { modalOrder = adminOrders.find(o=>o.id===btn.dataset.id); render(); };
+    });
+    document.querySelectorAll('.restock-btn[data-restock]').forEach(btn=>{
+      btn.onclick = async () => {
+        try{
+          await api('orders.php', {method:'PATCH', body:{id: btn.dataset.restock, action:'restock'}});
+          await reloadAdminOrdersWithDate();
+          await loadAdminData();
+          showToast('Stock restored to inventory');
+          render();
+        }catch(e){ showToast(e.message); }
+      };
+    });
+    document.querySelectorAll('[data-admin-trash]').forEach(btn=>{
+      btn.onclick = async () => {
+        try{
+          await api('orders.php', {method:'PATCH', body:{action:'trash', id:btn.dataset.adminTrash}});
+          selectedOrderIds.delete(btn.dataset.adminTrash);
+          await reloadAdminOrdersWithDate();
+          showToast('Moved to Trash');
+          render();
+        }catch(e){ showToast(e.message); }
+      };
+    });
+  }
+
+  // Shared: checkbox selection + bulk bar (both store history list and admin orders list)
+  document.querySelectorAll('.order-select-cb').forEach(cb=>{
+    cb.onchange = () => { if (cb.checked) selectedOrderIds.add(cb.dataset.id); else selectedOrderIds.delete(cb.dataset.id); render(); };
+  });
+  const selectAll = document.getElementById('select-all-cb');
+  if (selectAll){
+    selectAll.onchange = () => {
+      const ids = Array.from(document.querySelectorAll('.order-select-cb')).map(cb=>cb.dataset.id);
+      if (selectAll.checked) ids.forEach(id=>selectedOrderIds.add(id)); else ids.forEach(id=>selectedOrderIds.delete(id));
+      render();
+    };
+  }
+  const bulkApply = document.getElementById('bulk-apply-btn');
+  if (bulkApply){
+    bulkApply.onclick = async () => {
+      const action = document.getElementById('bulk-action-select').value;
+      if (!action){ showToast('Choose a bulk action first'); return; }
+      const ids = Array.from(selectedOrderIds);
+      try{
+        if (action === 'trash'){
+          await api('orders.php', {method:'PATCH', body:{action:'bulk_trash', ids}});
+          showToast(`${ids.length} order(s) moved to Trash`);
+        } else if (action.startsWith('status:')){
+          const status = action.split(':')[1];
+          await api('orders.php', {method:'PATCH', body:{action:'bulk_status', ids, status}});
+          showToast(`${ids.length} order(s) updated`);
+        }
+        selectedOrderIds = new Set();
+        if (actor.type==='store') await reloadStoreOrdersWithDate(); else await reloadAdminOrdersWithDate();
+        render();
+      }catch(e){ showToast(e.message); }
+    };
+  }
+  const bulkClear = document.getElementById('bulk-clear-btn');
+  if (bulkClear) bulkClear.onclick = () => { selectedOrderIds = new Set(); render(); };
+}
+
+/* ---------------- ADMIN: STORES ---------------- */
 function adminStoresPanel(){
   const pending = resetRequestsStore;
   const primaries = adminAccounts.filter(a=>a.role==='owner');
@@ -1124,7 +1471,7 @@ function adminStoresPanel(){
     <div class="panel"><h2><span class="dot"></span>Create a store</h2>
       <div class="row3">
         <div><label>Store name</label><input id="acc-storename" placeholder="e.g. Amaka's Boutique" /></div>
-        <div><label>Password (at least 6 characters)</label><div class="pw-field"><input id="acc-password" type="password" placeholder="Set a password" /><button type="button" class="pw-toggle" data-target="acc-password">👁</button></div></div>
+        <div><label>Password (at least 6 characters)</label><div class="pw-field"><input id="acc-password" type="password" placeholder="Set a password" autocomplete="new-password" /><button type="button" class="pw-toggle" data-target="acc-password">👁</button></div></div>
         <div style="display:flex;align-items:flex-start;"><button class="btn" id="acc-create-btn" style="width:100%;" ${busy?'disabled':''}>${busy?'<span class="spinner-inline"></span>':'Generate Store ID'}</button></div>
       </div>
     </div>
@@ -1156,6 +1503,53 @@ function accountRow(a){
     <button class="admin-update-btn" data-reset-store="${a.id}" data-label="${escapeHtml(a.position||'Team member')} (${escapeHtml(a.store_id)})">Reset password</button>
     <button class="admin-update-btn" data-remove-store="${a.id}">Remove</button></div>`;
 }
+function attachStoresHandlers(){
+  if (actor.type!=='admin') return;
+  const createAccBtn = document.getElementById('acc-create-btn');
+  if (createAccBtn){
+    createAccBtn.onclick = async () => {
+      const storeName = document.getElementById('acc-storename').value.trim();
+      const password = document.getElementById('acc-password').value;
+      if (!storeName || !password || password.length < 6){ showToast('Enter a store name and a password of at least 6 characters'); return; }
+      busy = true; render();
+      try{
+        const r = await api('stores.php', {method:'POST', body:{store_name: storeName, password}});
+        onceCred = {label:'Store login created — share these with the store:', storeId:r.store_id, password:r.password};
+        await loadAdminData();
+      }catch(e){ showToast(e.message); }
+      busy = false; render();
+    };
+  }
+  document.querySelectorAll('[data-remove-store]').forEach(btn=>{
+    btn.onclick = async () => {
+      if (!confirm('Remove this login? They will no longer be able to log in. Order history stays intact.')) return;
+      try{ await api('stores.php', {method:'DELETE', body:{id:parseInt(btn.dataset.removeStore,10)}}); await loadAdminData(); showToast('Login removed'); render(); }
+      catch(e){ showToast(e.message); }
+    };
+  });
+  document.querySelectorAll('[data-reset-store]').forEach(btn=>{
+    btn.onclick = () => { resetPwTarget = {kind:'store', id: parseInt(btn.dataset.resetStore,10), label: btn.dataset.label}; render(); };
+  });
+  document.querySelectorAll('[data-toggle-store]').forEach(row=>{
+    row.onclick = (e) => {
+      if (e.target.closest('button')) return;
+      const id = row.dataset.toggleStore;
+      if (expandedStores.has(id)) expandedStores.delete(id); else expandedStores.add(id);
+      render();
+    };
+  });
+  document.querySelectorAll('[data-resolve-reset]').forEach(btn=>{
+    btn.onclick = async () => {
+      try{
+        await api('reset-requests.php', {method:'PATCH', body:{id:parseInt(btn.dataset.resolveReset,10)}});
+        await Promise.all([loadResetRequests('store'), loadResetRequests('admin')]);
+        showToast('Marked resolved'); render();
+      }catch(e){ showToast(e.message); }
+    };
+  });
+}
+
+/* ---------------- ADMIN: ADMIN TEAM ---------------- */
 function adminTeamPanel(){
   const pending = resetRequestsAdmin;
   return `
@@ -1169,7 +1563,7 @@ function adminTeamPanel(){
       <div class="row3">
         <div><label>Name</label><input id="admin-name" placeholder="e.g. Tunde" /></div>
         <div><label>Position</label><input id="admin-position" placeholder="e.g. Inventory Manager" /></div>
-        <div><label>Password (at least 6 characters)</label><div class="pw-field"><input id="admin-password" type="password" placeholder="Set a password" /><button type="button" class="pw-toggle" data-target="admin-password">👁</button></div></div>
+        <div><label>Password (at least 6 characters)</label><div class="pw-field"><input id="admin-password" type="password" placeholder="Set a password" autocomplete="new-password" /><button type="button" class="pw-toggle" data-target="admin-password">👁</button></div></div>
       </div>
       <label>What can they handle?</label>
       <div class="checklist">
@@ -1194,24 +1588,38 @@ function adminAccountRow(a){
       <button class="admin-update-btn" data-admin="${a.id}" ${adminAdmins.length<=1?'disabled':''}>${adminAdmins.length<=1?'Only admin':'Remove'}</button>
     </div></div>`;
 }
-function adminRow(o){
-  const sm = statusMeta(o.status);
-  const total = (o.deliveryFee||0)+(o.otherCharges||0);
-  const canRestock = (o.status==='cancelled' || o.status==='issue') && !o.restocked;
-  return `<div class="admin-row">
-    <div class="admin-store">${escapeHtml(o.store)}</div>
-    <div class="admin-main"><div class="item">${escapeHtml(o.item)}${o.qty>1?' × '+o.qty:''} <span class="mono" style="color:var(--slate);font-size:11px;">#${escapeHtml(o.id)}</span></div>
-    <div class="sub">${escapeHtml(o.customer)} · ${escapeHtml(o.phone)}${o.altPhone?' / '+escapeHtml(o.altPhone):''} — to ${escapeHtml(o.dropoff)}${o.lastUpdatedBy?' · by '+escapeHtml(o.lastUpdatedBy):''}</div></div>
-    <span class="badge ${sm.badge}">${sm.label}</span>
-    <div class="admin-charges">${total ? `<b>${money(total)}</b>` : '—'}</div>
-    <div>${canRestock ? `<button class="restock-btn" data-restock="${escapeHtml(o.id)}">Restock</button>` : (o.restocked ? '<span style="font-size:10px;color:var(--slate);">restocked</span>' : '')}</div>
-    <button class="admin-update-btn" data-id="${escapeHtml(o.id)}">Update</button></div>`;
+function attachAdminTeamHandlers(){
+  if (actor.type!=='admin') return;
+  document.querySelectorAll('.admin-update-btn[data-admin]').forEach(btn=>{
+    btn.onclick = async () => {
+      if (!confirm('Remove this admin login?')) return;
+      try{ await api('admins.php', {method:'DELETE', body:{id:parseInt(btn.dataset.admin,10)}}); await loadAdminAdmins(); showToast('Admin removed'); render(); }
+      catch(e){ showToast(e.message); }
+    };
+  });
+  const createAdminBtn = document.getElementById('admin-create-btn');
+  if (createAdminBtn){
+    createAdminBtn.onclick = async () => {
+      const name = document.getElementById('admin-name').value.trim();
+      const position = document.getElementById('admin-position').value.trim();
+      const password = document.getElementById('admin-password').value;
+      const checked = Array.from(document.querySelectorAll('.admin-perm-cb:checked')).map(cb=>cb.value);
+      if (!name || !password || password.length < 6){ showToast('Enter a name and a password of at least 6 characters'); return; }
+      busy = true; render();
+      try{
+        const r = await api('admins.php', {method:'POST', body:{name, position, password, permissions:checked}});
+        onceCred = {label:'Admin login created — share these with them:', storeId:r.admin_id, password:r.password};
+        await loadAdminAdmins();
+      }catch(e){ showToast(e.message); }
+      busy = false; render();
+    };
+  }
+  document.querySelectorAll('[data-reset-admin]').forEach(btn=>{
+    btn.onclick = () => { resetPwTarget = {kind:'admin', id: parseInt(btn.dataset.resetAdmin,10), label: btn.dataset.label}; render(); };
+  });
 }
-function adminInvRow(i){
-  const low = i.qty<=LOW_STOCK_THRESHOLD;
-  return `<div class="inv-row"><div><div class="inv-name">${escapeHtml(i.name)} <span class="mono" style="color:var(--slate);font-size:11px;">${escapeHtml(i.store_name)}</span></div>${i.dropped_off_at?`<div class="inv-date">Dropped off ${escapeHtml(i.dropped_off_at)}</div>`:''}</div>
-    <span class="badge ${low?'badge-low':'badge-ok'}">${low ? (i.qty<=0?'Out of stock':'Low stock') : 'In stock'}</span><div class="inv-qty">${i.qty}</div><div></div><div></div></div>`;
-}
+
+/* ---------------- ADMIN: WITHDRAWALS ---------------- */
 function adminWithdrawalsPanel(){
   const pending = adminWithdrawals.pending || [];
   const resolved = adminWithdrawals.resolved || [];
@@ -1237,6 +1645,23 @@ function adminWithdrawalsPanel(){
         </div>`).join('') : '<div class="empty">No resolved requests yet.</div>'}
     </div>`;
 }
+function attachWithdrawalsHandlers(){
+  if (actor.type!=='admin') return;
+  document.querySelectorAll('[data-withdraw-paid]').forEach(btn=>{
+    btn.onclick = async () => {
+      try{ await api('withdrawals.php', {method:'PATCH', body:{id:parseInt(btn.dataset.withdrawPaid,10), status:'paid'}}); await loadAdminWithdrawals(); showToast('Marked as paid'); render(); }
+      catch(e){ showToast(e.message); }
+    };
+  });
+  document.querySelectorAll('[data-withdraw-decline]').forEach(btn=>{
+    btn.onclick = async () => {
+      try{ await api('withdrawals.php', {method:'PATCH', body:{id:parseInt(btn.dataset.withdrawDecline,10), status:'declined'}}); await loadAdminWithdrawals(); showToast('Declined — balance returned to store'); render(); }
+      catch(e){ showToast(e.message); }
+    };
+  });
+}
+
+/* ---------------- ADMIN: EXPENSES ---------------- */
 function adminExpensesPanel(){
   if (window._expenseDateQuick === undefined){
     const {from, to} = quickRangeDates('month');
@@ -1255,6 +1680,11 @@ function adminExpensesPanel(){
         <button data-expensequick="week" class="${q==='week'?'active':''}">This week</button>
         <button data-expensequick="month" class="${q==='month'?'active':''}">This month</button>
         <button data-expensequick="all" class="${q==='all'?'active':''}">All time</button>
+        <span style="font-size:11px;color:var(--slate);margin-left:2px;">or:</span>
+        <input type="date" id="expense-custom-from" value="${window._expenseDateFrom||''}" style="width:auto;margin-bottom:0;">
+        <span style="font-size:11px;color:var(--slate);">to</span>
+        <input type="date" id="expense-custom-to" value="${window._expenseDateTo||''}" style="width:auto;margin-bottom:0;">
+        <button class="btn btn-sm" id="expense-custom-apply">Apply</button>
       </div>
       <div class="stat-row">
         <div class="stat" style="cursor:default;"><div class="n">${money(feesEarned)}</div><div class="l">Fees billed to stores</div></div>
@@ -1287,182 +1717,8 @@ function adminExpensesPanel(){
         </div>`).join('') : '<div class="empty">No expenses logged in this range.</div>'}
     </div>`;
 }
-function updateModal(o){
-  return `<div class="modal-overlay" id="modal-overlay"><div class="modal">
-    <h3>${escapeHtml(o.item)}${o.qty>1?' × '+o.qty:''}</h3><div class="id mono">#${escapeHtml(o.id)} · ${escapeHtml(o.store)}</div>
-    <label>Status</label><select id="modal-status">${STATUSES.map(s=>`<option value="${s.v}" ${s.v===o.status?'selected':''}>${s.label}</option>`).join('')}</select>
-    <label>Rider / driver (optional)</label><input id="modal-rider" value="${escapeHtml(o.rider||'')}" placeholder="e.g. Tunde" />
-    <div class="row2"><div><label>Delivery fee</label><input id="modal-delivery-fee" type="number" min="0" value="${o.deliveryFee||0}" /></div>
-    <div><label>Other charges</label><input id="modal-other-charges" type="number" min="0" value="${o.otherCharges||0}" /></div></div>
-    <label>Charge note</label><input id="modal-charge-note" value="${escapeHtml(o.chargeNote||'')}" placeholder="e.g. Failed delivery fee" />
-    <label>Dispatch note</label><textarea id="modal-remark" rows="3">${escapeHtml(o.remark||'')}</textarea>
-    <div class="modal-actions"><button class="btn btn-outline" id="modal-cancel">Cancel</button><button class="btn" id="modal-save" ${busy?'disabled':''}>${busy?'<span class="spinner-inline"></span>':'Save update'}</button></div>
-    </div></div>`;
-}
-function newOrdersPopup(list){
-  return `<div class="modal-overlay" id="popup-overlay"><div class="modal">
-    <h3>${list.length ? 'New orders waiting' : "You're all caught up"}</h3>
-    <div class="id">${list.length ? list.length + ' order' + (list.length>1?'s':'') + ' need attention' : 'No unseen orders'}</div>
-    ${list.slice(0,12).map(o=>`<div class="new-order-item"><span class="store-tag">${escapeHtml(o.store)}</span>${escapeHtml(o.item)} — ${escapeHtml(o.customer)} · ${escapeHtml(o.phone)}</div>`).join('')}
-    <div class="modal-actions"><button class="btn btn-outline" id="popup-close">Close</button>${list.length ? '<button class="btn" id="popup-mark-seen">Mark all as seen</button>' : ''}</div>
-    </div></div>`;
-}
-function attachAdminHandlers(){
-  attachHeaderHandlers();
-  attachPasswordToggles();
-  attachPasswordChangeHandlers();
-  attachGreetingHandler();
-  attachReportHandlers(true);
-
-  document.querySelectorAll('.tab-btn[data-admintab]').forEach(btn=>{
-    btn.onclick = async () => {
-      adminTab = btn.dataset.admintab; onceCred = null; render();
-      try{
-        if (adminTab === 'stores'){ await loadResetRequests('store'); render(); }
-        if (adminTab === 'team'){ await Promise.all([loadAdminAdmins(), loadResetRequests('admin')]); render(); }
-        if (adminTab === 'withdrawals'){ await loadAdminWithdrawals(); render(); }
-        if (adminTab === 'expenses'){ await loadExpenses(); render(); }
-        if (adminTab === 'report'){
-          await loadReportData(window._reportStoreId, window._reportSearch);
-          if (!window._reportStoreId && (reportData.storeOptions||[]).length){
-            window._reportStoreId = reportData.storeOptions[0].store_id;
-            await loadReportData(window._reportStoreId, window._reportSearch);
-          }
-          render();
-        }
-      }catch(e){ showToast(e.message); }
-    };
-  });
-  document.querySelectorAll('[data-statfilter]').forEach(btn=>{ btn.onclick = () => { window._filterStatus = btn.dataset.statfilter; render(); }; });
-  document.querySelectorAll('[data-quickdate]').forEach(btn=>{
-    btn.onclick = async () => {
-      window._ordersDateQuick = btn.dataset.quickdate;
-      const {from, to} = quickRangeDates(btn.dataset.quickdate);
-      window._ordersDateFrom = from; window._ordersDateTo = to;
-      try{ await reloadAdminOrdersWithDate(); render(); }catch(e){ showToast(e.message); }
-    };
-  });
-
-  const fs = document.getElementById('filter-store');
-  const fst = document.getElementById('filter-status');
-  const invFs = document.getElementById('inv-filter-store');
-  const search = document.getElementById('search-orders');
-  if (fs) fs.onchange = async e => { window._filterStore = e.target.value; try{ await reloadAdminOrdersWithDate(); render(); }catch(err){ showToast(err.message); } };
-  if (fst) fst.onchange = e => { window._filterStatus = e.target.value; render(); };
-  if (invFs) invFs.onchange = e => { window._invFilterStore = e.target.value; render(); };
-  if (search){ search.oninput = e => { window._searchTerm = e.target.value; }; search.addEventListener('keydown', e=>{ if (e.key==='Enter'){ render(); } }); }
-  const searchBtn = document.getElementById('search-btn');
-  if (searchBtn) searchBtn.onclick = () => render();
-
-  document.querySelectorAll('.admin-update-btn[data-id]').forEach(btn=>{
-    btn.onclick = () => { modalOrder = adminOrders.find(o=>o.id===btn.dataset.id); render(); };
-  });
-  document.querySelectorAll('.restock-btn[data-restock]').forEach(btn=>{
-    btn.onclick = async () => {
-      try{
-        await api('orders.php', {method:'PATCH', body:{id: btn.dataset.restock, action:'restock'}});
-        await reloadAdminOrdersWithDate();
-        await loadAdminData();
-        showToast('Stock restored to inventory');
-        render();
-      }catch(e){ showToast(e.message); }
-    };
-  });
-
-  const createAccBtn = document.getElementById('acc-create-btn');
-  if (createAccBtn){
-    createAccBtn.onclick = async () => {
-      const storeName = document.getElementById('acc-storename').value.trim();
-      const password = document.getElementById('acc-password').value;
-      if (!storeName || !password || password.length < 6){ showToast('Enter a store name and a password of at least 6 characters'); return; }
-      busy = true; render();
-      try{
-        const r = await api('stores.php', {method:'POST', body:{store_name: storeName, password}});
-        onceCred = {label:'Store login created — share these with the store:', storeId:r.store_id, password:r.password};
-        await loadAdminData();
-      }catch(e){ showToast(e.message); }
-      busy = false; render();
-    };
-  }
-  const onceDismiss = document.getElementById('once-cred-dismiss');
-  if (onceDismiss) onceDismiss.onclick = () => { onceCred = null; render(); };
-
-  document.querySelectorAll('[data-remove-store]').forEach(btn=>{
-    btn.onclick = async () => {
-      if (!confirm('Remove this login? They will no longer be able to log in. Order history stays intact.')) return;
-      try{ await api('stores.php', {method:'DELETE', body:{id:parseInt(btn.dataset.removeStore,10)}}); await loadAdminData(); showToast('Login removed'); render(); }
-      catch(e){ showToast(e.message); }
-    };
-  });
-  document.querySelectorAll('[data-reset-store]').forEach(btn=>{
-    btn.onclick = () => { resetPwTarget = {kind:'store', id: parseInt(btn.dataset.resetStore,10), label: btn.dataset.label}; render(); };
-  });
-  document.querySelectorAll('[data-reset-admin]').forEach(btn=>{
-    btn.onclick = () => { resetPwTarget = {kind:'admin', id: parseInt(btn.dataset.resetAdmin,10), label: btn.dataset.label}; render(); };
-  });
-  attachResetPasswordModalHandlers(async (newPassword) => {
-    if (resetPwTarget.kind === 'admin'){
-      const r = await api('admins.php', {method:'PATCH', body:{id: resetPwTarget.id, new_password: newPassword}});
-      onceCred = {label:'New password set — share it with them:', storeId: resetPwTarget.label, password:r.new_password};
-    } else {
-      const r = await api('stores.php', {method:'PATCH', body:{id: resetPwTarget.id, new_password: newPassword}});
-      onceCred = {label:'New password set — share it with them:', storeId: resetPwTarget.label, password:r.new_password};
-    }
-    resetPwTarget = null;
-  });
-  document.querySelectorAll('[data-toggle-store]').forEach(row=>{
-    row.onclick = (e) => {
-      if (e.target.closest('button')) return;
-      const id = row.dataset.toggleStore;
-      if (expandedStores.has(id)) expandedStores.delete(id); else expandedStores.add(id);
-      render();
-    };
-  });
-  document.querySelectorAll('[data-resolve-reset]').forEach(btn=>{
-    btn.onclick = async () => {
-      try{
-        await api('reset-requests.php', {method:'PATCH', body:{id:parseInt(btn.dataset.resolveReset,10)}});
-        await Promise.all([loadResetRequests('store'), loadResetRequests('admin')]);
-        showToast('Marked resolved'); render();
-      }catch(e){ showToast(e.message); }
-    };
-  });
-  document.querySelectorAll('.admin-update-btn[data-admin]').forEach(btn=>{
-    btn.onclick = async () => {
-      if (!confirm('Remove this admin login?')) return;
-      try{ await api('admins.php', {method:'DELETE', body:{id:parseInt(btn.dataset.admin,10)}}); await loadAdminAdmins(); showToast('Admin removed'); render(); }
-      catch(e){ showToast(e.message); }
-    };
-  });
-  const createAdminBtn = document.getElementById('admin-create-btn');
-  if (createAdminBtn){
-    createAdminBtn.onclick = async () => {
-      const name = document.getElementById('admin-name').value.trim();
-      const position = document.getElementById('admin-position').value.trim();
-      const password = document.getElementById('admin-password').value;
-      const checked = Array.from(document.querySelectorAll('.admin-perm-cb:checked')).map(cb=>cb.value);
-      if (!name || !password || password.length < 6){ showToast('Enter a name and a password of at least 6 characters'); return; }
-      busy = true; render();
-      try{
-        const r = await api('admins.php', {method:'POST', body:{name, position, password, permissions:checked}});
-        onceCred = {label:'Admin login created — share these with them:', storeId:r.admin_id, password:r.password};
-        await loadAdminAdmins();
-      }catch(e){ showToast(e.message); }
-      busy = false; render();
-    };
-  }
-  document.querySelectorAll('[data-withdraw-paid]').forEach(btn=>{
-    btn.onclick = async () => {
-      try{ await api('withdrawals.php', {method:'PATCH', body:{id:parseInt(btn.dataset.withdrawPaid,10), status:'paid'}}); await loadAdminWithdrawals(); showToast('Marked as paid'); render(); }
-      catch(e){ showToast(e.message); }
-    };
-  });
-  document.querySelectorAll('[data-withdraw-decline]').forEach(btn=>{
-    btn.onclick = async () => {
-      try{ await api('withdrawals.php', {method:'PATCH', body:{id:parseInt(btn.dataset.withdrawDecline,10), status:'declined'}}); await loadAdminWithdrawals(); showToast('Declined — balance returned to store'); render(); }
-      catch(e){ showToast(e.message); }
-    };
-  });
+function attachExpensesHandlers(){
+  if (actor.type!=='admin') return;
   document.querySelectorAll('[data-expensequick]').forEach(btn=>{
     btn.onclick = async () => {
       window._expenseDateQuick = btn.dataset.expensequick;
@@ -1471,6 +1727,15 @@ function attachAdminHandlers(){
       try{ await loadExpenses(); render(); }catch(e){ showToast(e.message); }
     };
   });
+  const customApply = document.getElementById('expense-custom-apply');
+  if (customApply){
+    customApply.onclick = async () => {
+      window._expenseDateFrom = document.getElementById('expense-custom-from').value;
+      window._expenseDateTo = document.getElementById('expense-custom-to').value;
+      window._expenseDateQuick = 'custom';
+      try{ await loadExpenses(); render(); }catch(e){ showToast(e.message); }
+    };
+  }
   const expAddBtn = document.getElementById('exp-add-btn');
   if (expAddBtn){
     expAddBtn.onclick = async () => {
@@ -1493,7 +1758,58 @@ function attachAdminHandlers(){
       catch(e){ showToast(e.message); }
     };
   });
+}
 
+/* ---------------- ADMIN: DELETED ORDERS (TRASH) ---------------- */
+function trashPanel(){
+  const list = adminTrash.slice().sort((a,b)=>b.updatedAt-a.updatedAt);
+  return `<div class="panel">
+    <h2><span class="dot"></span>Deleted Orders (${list.length})</h2>
+    <p class="hint">Orders moved to Trash by stores, team members, or admins. Restore to bring an order back to normal view, or permanently delete — that cannot be undone.</p>
+    ${list.length ? list.map(o=>{
+      const sm = statusMeta(o.status);
+      const total = (o.deliveryFee||0)+(o.otherCharges||0);
+      return `<div class="admin-row" style="grid-template-columns:auto 1.3fr auto auto auto;">
+        <div class="admin-store">${escapeHtml(o.store)}</div>
+        <div class="admin-main"><div class="item">${escapeHtml(o.item)}${o.qty>1?' × '+o.qty:''} <span class="mono" style="color:var(--slate);font-size:11px;">#${escapeHtml(o.id)}</span></div>
+        <div class="sub">${escapeHtml(o.customer)} · ${escapeHtml(o.phone)} — to ${escapeHtml(o.dropoff)}</div></div>
+        <span class="badge ${sm.badge}">${sm.label}</span>
+        <div class="admin-charges">${total ? `<b>${money(total)}</b>` : '—'}</div>
+        <div style="display:flex;gap:8px;">
+          <button class="restore-btn" data-restore="${escapeHtml(o.id)}">Restore</button>
+          <button class="danger-btn" data-perm-delete="${escapeHtml(o.id)}">Delete forever</button>
+        </div>
+      </div>`;
+    }).join('') : '<div class="empty">Trash is empty.</div>'}
+  </div>`;
+}
+function attachTrashHandlers(){
+  if (actor.type!=='admin') return;
+  document.querySelectorAll('[data-restore]').forEach(btn=>{
+    btn.onclick = async () => {
+      try{
+        await api('orders.php', {method:'PATCH', body:{action:'restore', id:btn.dataset.restore}});
+        await loadTrash();
+        showToast('Order restored');
+        render();
+      }catch(e){ showToast(e.message); }
+    };
+  });
+  document.querySelectorAll('[data-perm-delete]').forEach(btn=>{
+    btn.onclick = async () => {
+      if (!confirm('Permanently delete this order? This cannot be undone.')) return;
+      try{
+        await api('orders.php', {method:'DELETE', body:{id:btn.dataset.permDelete}});
+        await loadTrash();
+        showToast('Order permanently deleted');
+        render();
+      }catch(e){ showToast(e.message); }
+    };
+  });
+}
+
+/* ---------------- POPUPS ---------------- */
+function attachPopupHandlers(){
   const overlay = document.getElementById('modal-overlay');
   if (overlay){
     document.getElementById('modal-cancel').onclick = () => { modalOrder = null; render(); };
@@ -1529,6 +1845,21 @@ function attachAdminHandlers(){
       };
     }
     popupOverlay.addEventListener('click', e => { if (e.target.id==='popup-overlay'){ popupOpen=false; render(); } });
+  }
+  const sentOverlay = document.getElementById('sentreport-overlay');
+  if (sentOverlay){
+    document.getElementById('sentreport-ack-btn').onclick = async () => {
+      try{ await api('sent-reports.php', {method:'POST', body:{action:'ack'}}); mySentReports = []; reportPopupOpen = false; render(); }
+      catch(e){ showToast(e.message); }
+    };
+  }
+  const lowOverlay = document.getElementById('lowstock-overlay');
+  if (lowOverlay){
+    const closeBtn = document.getElementById('lowstock-close');
+    if (closeBtn) closeBtn.onclick = () => { lowStockPopupOpen=false; render(); };
+    const gotoBtn = document.getElementById('lowstock-goto');
+    if (gotoBtn) gotoBtn.onclick = () => { lowStockPopupOpen=false; activeSection='inventory'; render(); };
+    lowOverlay.addEventListener('click', e => { if (e.target.id==='lowstock-overlay'){ lowStockPopupOpen=false; render(); } });
   }
 }
 

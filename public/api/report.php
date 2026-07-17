@@ -16,7 +16,7 @@ if ($method === 'GET') {
 
         $storeLoginId = str_field($_GET, 'store_id');
         if ($storeLoginId === '') {
-            json_response(['store' => null, 'rows' => [], 'totals' => ['amount' => 0, 'charge' => 0, 'balance' => 0], 'storeOptions' => $storeOptions]);
+            json_response(['store' => null, 'storeId' => null, 'rows' => [], 'totals' => ['amount' => 0, 'charge' => 0, 'balance' => 0], 'storeOptions' => $storeOptions]);
         }
         $stmt = $pdo->prepare('SELECT id, store_name FROM stores WHERE store_id = ? AND role = "owner"');
         $stmt->execute([$storeLoginId]);
@@ -28,13 +28,15 @@ if ($method === 'GET') {
         $storeName = $store['store_name'];
     } else {
         $ownerRowId = $actor['owner_row_id'];
-        $stmt = $pdo->prepare('SELECT store_name FROM stores WHERE id = ?');
+        $stmt = $pdo->prepare('SELECT store_name, store_id FROM stores WHERE id = ?');
         $stmt->execute([$ownerRowId]);
-        $storeName = $stmt->fetchColumn();
+        $storeRow = $stmt->fetch();
+        $storeName = $storeRow['store_name'];
+        $storeLoginId = $storeRow['store_id'];
     }
 
     $q = str_field($_GET, 'q');
-    $sql = 'SELECT * FROM orders WHERE store_id = ?';
+    $sql = 'SELECT * FROM orders WHERE store_id = ? AND deleted = 0';
     $params = [$ownerRowId];
     apply_date_range($sql, $params, 'updated_at');
     if ($q !== '') {
@@ -63,6 +65,7 @@ if ($method === 'GET') {
         return [
             'id' => $o['order_code'],
             'customer' => $o['customer_name'],
+            'phone' => $o['phone'],
             'item' => $o['product_name'],
             'qty' => (int) $o['qty'],
             'dropoff' => $o['delivery_address'],
@@ -70,11 +73,15 @@ if ($method === 'GET') {
             'amount' => $amount,
             'charge' => $charge,
             'balance' => $balance,
+            // Day the order was last resolved (updated) — this is what the
+            // report groups by, not the day it was placed.
+            'date' => date('Y-m-d', strtotime($o['updated_at'])),
         ];
     }, $orders);
 
     json_response([
         'store' => $storeName,
+        'storeId' => $storeLoginId,
         'rows' => $rows,
         'totals' => ['amount' => $totalAmount, 'charge' => $totalCharge, 'balance' => $totalBalance],
         'storeOptions' => $storeOptions ?? null,
@@ -96,13 +103,39 @@ if ($method === 'POST') {
         json_error('Store not found.', 404);
     }
 
-    $stmt = $pdo->prepare('INSERT INTO sent_reports (store_id, range_label, date_from, date_to, sent_by_admin_id) VALUES (?, ?, ?, ?, ?)');
-    $stmt->execute([
-        $ownerRowId, $rangeLabel,
-        preg_match('/^\d{4}-\d{2}-\d{2}$/', $dateFrom) ? $dateFrom : null,
-        preg_match('/^\d{4}-\d{2}-\d{2}$/', $dateTo) ? $dateTo : null,
-        $actor['row_id'],
-    ]);
+    $validFrom = preg_match('/^\d{4}-\d{2}-\d{2}$/', $dateFrom) ? $dateFrom : null;
+    $validTo = preg_match('/^\d{4}-\d{2}-\d{2}$/', $dateTo) ? $dateTo : null;
+
+    $pdo->beginTransaction();
+    try {
+        $stmt = $pdo->prepare('INSERT INTO sent_reports (store_id, range_label, date_from, date_to, sent_by_admin_id) VALUES (?, ?, ?, ?, ?)');
+        $stmt->execute([$ownerRowId, $rangeLabel, $validFrom, $validTo, $actor['row_id']]);
+
+        // Mark every "Delivered" order in this filtered range as "Remitted"
+        // — meaning it's now been reported/reconciled, distinct from actual
+        // bank payment (handled separately by Withdrawals). This prevents
+        // the same delivered orders from being reported as outstanding
+        // again in a future report. Wallet balance keeps counting Remitted
+        // the same as Delivered (see store_delivered_total()).
+        $updateSql = "UPDATE orders SET status = 'remitted', updated_at = CURRENT_TIMESTAMP WHERE store_id = ? AND status = 'delivered' AND deleted = 0";
+        $updateParams = [$ownerRowId];
+        if ($validFrom !== null) {
+            $updateSql .= ' AND updated_at >= ?';
+            $updateParams[] = $validFrom . ' 00:00:00';
+        }
+        if ($validTo !== null) {
+            $updateSql .= ' AND updated_at <= ?';
+            $updateParams[] = $validTo . ' 23:59:59';
+        }
+        $pdo->prepare($updateSql)->execute($updateParams);
+
+        $pdo->commit();
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        throw $e;
+    }
 
     json_response(['ok' => true], 201);
 }

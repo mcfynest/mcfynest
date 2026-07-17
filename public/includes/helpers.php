@@ -95,7 +95,9 @@ function money(?float $n): string
  */
 function store_delivered_total(PDO $pdo, int $ownerRowId): float
 {
-    $stmt = $pdo->prepare("SELECT COALESCE(SUM(amount - delivery_fee - other_charges), 0) FROM orders WHERE store_id = ? AND status = 'delivered'");
+    // Remitted is a further state after Delivered (report reconciliation),
+    // not a replacement — it must keep counting toward the wallet balance.
+    $stmt = $pdo->prepare("SELECT COALESCE(SUM(amount - delivery_fee - other_charges), 0) FROM orders WHERE store_id = ? AND status IN ('delivered', 'remitted')");
     $stmt->execute([$ownerRowId]);
     return (float) $stmt->fetchColumn();
 }
