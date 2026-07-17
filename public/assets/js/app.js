@@ -19,6 +19,9 @@ const STATUSES = [
   {v:'cancelled', label:'Cancelled', badge:'badge-cancelled', dim:'#EAEAEA', solid:'#666'},
 ];
 const statusMeta = v => STATUSES.find(s=>s.v===v) || STATUSES[0];
+// Statuses tucked out of the default "Active" order view — still fully
+// reachable via their own status pill, just not cluttering the default list.
+const ARCHIVED_STATUSES = ['remitted', 'cancelled', 'returned'];
 const LOW_STOCK_THRESHOLD = 1;       // inline badge/banner — qty<=1 ("low"/"out")
 const POPUP_LOW_STOCK_THRESHOLD = 2; // login popup — "2 or fewer units" per spec
 const IDLE_LIMIT_MS = 30 * 60 * 1000;
@@ -31,6 +34,7 @@ const GREETINGS = [
   "let's keep the wheels turning today.",
   "your dispatch team has your back today.",
 ];
+const COMMON_ZONES = ['Ikeja','Lekki','Victoria Island','Yaba','Surulere','Badagry','Ajah','Ikorodu','Apapa','Shomolu','Oshodi','Festac','Gbagada','Magodo','Ojota'];
 
 const STORE_TEAM_PERMS = [
   {k:'order', label:'New Order'}, {k:'inventory', label:'Stock Drop-offs'}, {k:'history', label:'Order History'},
@@ -38,11 +42,11 @@ const STORE_TEAM_PERMS = [
 const ADMIN_PERMS = [
   {k:'orders', label:'Orders'}, {k:'inventory', label:'Inventory'}, {k:'stores', label:'Stores'},
   {k:'team', label:'Admin Team'}, {k:'withdrawals', label:'Withdrawals'}, {k:'expenses', label:'Expenses'},
-  {k:'trash', label:'Deleted Orders'},
+  {k:'customers', label:'Customers'}, {k:'zones', label:'Delivery Zones'}, {k:'trash', label:'Deleted Orders'},
 ];
 const STORE_SIDEBAR_ICONS = {orders:'📦', inventory:'📥', team:'👥', wallet:'💳', report:'📊'};
-const ADMIN_SIDEBAR_ICONS = {orders:'📦', inventory:'📥', stores:'🏬', team:'👥', withdrawals:'💳', expenses:'📊', trash:'🗑️', report:'📊'};
-const ADMIN_SIDEBAR_LABELS = {orders:'Orders', inventory:'Inventory', stores:'Stores', team:'Admin Team', withdrawals:'Withdrawals', expenses:'Expenses', trash:'Deleted Orders', report:'Report'};
+const ADMIN_SIDEBAR_ICONS = {orders:'📦', inventory:'📥', stores:'🏬', team:'👥', withdrawals:'💳', expenses:'📊', customers:'👤', zones:'🗺️', trash:'🗑️', report:'📊'};
+const ADMIN_SIDEBAR_LABELS = {orders:'Orders', inventory:'Inventory', stores:'Stores', team:'Admin Team', withdrawals:'Withdrawals', expenses:'Expenses', customers:'Customers', zones:'Delivery Zones', trash:'Deleted Orders', report:'Report'};
 
 let csrfToken = null;
 let actor = null;
@@ -69,6 +73,10 @@ let resetRequestsStore = [];
 let resetRequestsAdmin = [];
 let unseenCount = 0;
 let unseenOrders = [];
+let unseenWithdrawalCount = 0;
+let lowStockAdminCount = 0;
+let adminCustomers = [];
+let myTrash = []; // store's own trashed orders, loaded on demand
 
 let reportData = {store:null, storeId:null, rows:[], totals:{amount:0, charge:0, balance:0}};
 let reportDrillDay = null; // when set, report shows the detailed table for this day only
@@ -81,6 +89,10 @@ let modalOrder = null;
 let popupOpen = false;
 let reportPopupOpen = false;
 let lowStockPopupOpen = false;
+let withdrawalPopupOpen = false;
+let lowStockAdminPopupOpen = false;
+let sidebarOpen = false;
+let showMyTrash = false; // store view: toggle between active orders and their own trash
 let pwChangeOpen = false;
 let greetingDismissed = false;
 let greetingMsg = '';
@@ -148,14 +160,28 @@ async function boot(){
   }catch(e){ /* stay logged out */ }
   booted = true;
   if (actor && actor.type === 'store'){
-    activeSection = defaultStoreSection();
+    const hashSection = location.hash.slice(1);
+    activeSection = (hashSection && storeSidebarItems().some(i=>i.k===hashSection)) ? hashSection : defaultStoreSection();
     await loadStoreData(); await checkForSentReports(); checkForLowStock(); startIdleTimer();
   } else if (actor && actor.type === 'admin'){
-    activeSection = defaultAdminSection();
-    await loadAdminData(); await checkForNewOrders(); startQuietPoll(); startIdleTimer();
+    activeSection = defaultAdminSection(); // sidebar items (and hash validity) depend on data loaded below
+    await loadAdminData();
+    const hashSection = location.hash.slice(1);
+    if (hashSection && adminSidebarItems().some(i=>i.k===hashSection)) activeSection = hashSection;
+    await checkForNewOrders(); await checkForPendingWithdrawals(); checkForLowStockAdmin();
+    startQuietPoll(); startIdleTimer();
   }
   render();
   registerServiceWorker();
+  window.addEventListener('hashchange', onHashChange);
+}
+
+function onHashChange(){
+  if (!actor) return;
+  const h = location.hash.slice(1);
+  if (h && sidebarItems().some(i=>i.k===h) && h !== activeSection){
+    activeSection = h; selectedOrderIds = new Set(); selectedInvIds = new Set(); sidebarOpen = false; render();
+  }
 }
 
 function defaultStoreSection(){
@@ -168,7 +194,7 @@ function defaultStoreSection(){
 function defaultAdminSection(){
   if (!actor) return 'orders';
   const perms = actor.permissions || {};
-  for (const k of ['orders','inventory','stores','team','withdrawals','expenses']){ if (perms[k]) return k; }
+  for (const k of ['orders','inventory','stores','team','withdrawals','expenses','customers','zones']){ if (perms[k]) return k; }
   return 'report';
 }
 
@@ -192,23 +218,38 @@ function startQuietPoll(){
   stopQuietPoll();
   pollTimer = setInterval(async () => {
     if (!actor || actor.type !== 'admin') return;
-    try{ const r = await api('unseen.php'); unseenCount = r.count; patchBellBadge(); }
-    catch(e){ /* silent — background check, never surface errors */ }
+    const perms = actor.permissions || {};
+    try{
+      const calls = [
+        perms.orders ? api('unseen.php') : Promise.resolve({count:0}),
+        perms.withdrawals ? api('withdrawals.php?count=1') : Promise.resolve({count:0}),
+        perms.inventory ? api('products.php?lowstock_count=1') : Promise.resolve({count:0}),
+      ];
+      const [o, w, s] = await Promise.all(calls);
+      unseenCount = o.count; unseenWithdrawalCount = w.count; lowStockAdminCount = s.count;
+      patchBellBadges();
+    }catch(e){ /* silent — background check, never surface errors */ }
   }, 25000);
 }
 function stopQuietPoll(){ if (pollTimer){ clearInterval(pollTimer); pollTimer = null; } }
 
-/** Updates only the little count bubble on the bell button — never
+/** Updates only the little count bubbles on the bell buttons — never
  * touches the rest of the DOM, so it can never steal focus or blow away
- * text an admin is mid-typing. This is the "quiet badge" requirement. */
-function patchBellBadge(){
-  const bell = document.getElementById('bell-btn');
+ * text an admin is mid-typing. This is the "quiet badge" requirement,
+ * now covering all three admin bells (new orders, withdrawals, low stock). */
+function patchOneBellBadge(btnId, count){
+  const bell = document.getElementById(btnId);
   if (!bell) return;
-  let count = bell.querySelector('.bell-count');
-  if (unseenCount > 0){
-    if (!count){ count = document.createElement('span'); count.className = 'bell-count'; bell.appendChild(count); }
-    count.textContent = unseenCount;
-  } else if (count){ count.remove(); }
+  let badge = bell.querySelector('.bell-count');
+  if (count > 0){
+    if (!badge){ badge = document.createElement('span'); badge.className = 'bell-count'; bell.appendChild(badge); }
+    badge.textContent = count;
+  } else if (badge){ badge.remove(); }
+}
+function patchBellBadges(){
+  patchOneBellBadge('bell-btn', unseenCount);
+  patchOneBellBadge('withdraw-bell-btn', unseenWithdrawalCount);
+  patchOneBellBadge('lowstock-admin-bell-btn', lowStockAdminCount);
 }
 
 /* ---------------- DATA LOADERS ---------------- */
@@ -243,6 +284,22 @@ async function checkForNewOrders(){
   const r = await api('unseen.php?full=1');
   unseenCount = r.count; unseenOrders = r.orders;
   if (unseenOrders.length > 0){ popupOpen = true; }
+}
+async function checkForPendingWithdrawals(){
+  if (!(actor.permissions || {}).withdrawals) return;
+  try{
+    const r = await api('withdrawals.php');
+    adminWithdrawals = r;
+    const unseen = (r.pending || []).filter(w=>!w.seenByAdmin);
+    unseenWithdrawalCount = unseen.length;
+    if (unseen.length > 0){ withdrawalPopupOpen = true; }
+  }catch(e){}
+}
+function checkForLowStockAdmin(){
+  if (!(actor.permissions || {}).inventory) return;
+  const low = adminProducts.filter(i=>i.qty<=LOW_STOCK_THRESHOLD);
+  lowStockAdminCount = low.length;
+  if (low.length > 0){ lowStockAdminPopupOpen = true; }
 }
 async function checkForSentReports(){
   try{ const r = await api('sent-reports.php'); mySentReports = r.pending; if (mySentReports.length){ reportPopupOpen = true; } }catch(e){}
@@ -280,6 +337,16 @@ async function loadExpenses(){
 async function loadTrash(){
   const r = await api('orders.php?trash=1');
   adminTrash = r.orders;
+}
+async function loadMyTrash(){
+  const r = await api('orders.php?trash=1');
+  myTrash = r.orders;
+}
+async function loadCustomers(q){
+  const params = new URLSearchParams();
+  if (q) params.set('q', q);
+  const r = await api('customers.php?' + params.toString());
+  adminCustomers = r.customers;
 }
 async function reloadAdminOrdersWithDate(){
   const params = new URLSearchParams();
@@ -389,7 +456,7 @@ function attachLoginHandlers(){
         await loadStoreData(); await checkForSentReports(); checkForLowStock(); startIdleTimer();
       } else {
         activeSection = defaultAdminSection();
-        await loadAdminData(); await checkForNewOrders(); startQuietPoll(); startIdleTimer();
+        await loadAdminData(); await checkForNewOrders(); await checkForPendingWithdrawals(); checkForLowStockAdmin(); startQuietPoll(); startIdleTimer();
       }
     }catch(e){ loginError = e.message; }
     busy = false; render();
@@ -477,7 +544,7 @@ function storeSidebarItems(){
 }
 function adminSidebarItems(){
   const perms = actor.permissions || {};
-  const keys = ['orders','inventory','stores','team','withdrawals','expenses','trash'];
+  const keys = ['orders','inventory','stores','team','withdrawals','expenses','customers','zones','trash'];
   const items = keys.filter(k=>perms[k]).map(k=>({k, label:ADMIN_SIDEBAR_LABELS[k], ico:ADMIN_SIDEBAR_ICONS[k]}));
   items.push({k:'report', label:'Report', ico:ADMIN_SIDEBAR_ICONS.report});
   return items;
@@ -487,12 +554,14 @@ function sidebarItems(){ return actor.type === 'store' ? storeSidebarItems() : a
 function appShell(){
   const items = sidebarItems();
   if (!items.find(i=>i.k===activeSection)) activeSection = items[0] ? items[0].k : 'orders';
+  try{ if (location.hash.slice(1) !== activeSection) history.replaceState(null, '', '#' + activeSection); }catch(e){}
   return `
   <div class="shell">
-    <div class="sidebar">
+    ${sidebarOpen ? '<div class="sidebar-overlay show" id="sidebar-overlay"></div>' : ''}
+    <div class="sidebar ${sidebarOpen?'open':''}" id="app-sidebar">
       <div class="brand"><div class="brand-mark">M</div><div><div class="brand-name">MCFYNEST<br>LOGISTICS</div><div class="brand-sub">Dispatch CRM</div></div></div>
       <div class="side-section-label">${actor.type==='store'?'Store menu':'Admin menu'}</div>
-      ${items.map(i=>`<div class="side-item ${activeSection===i.k?'active':''}" data-section="${i.k}"><span class="ico">${i.ico}</span> ${i.label}</div>`).join('')}
+      ${items.map(i=>`<a href="#${i.k}" class="side-item ${activeSection===i.k?'active':''}" data-section="${i.k}"><span class="ico">${i.ico}</span> ${i.label}</a>`).join('')}
     </div>
     <div class="main">
       ${topbar()}
@@ -500,6 +569,8 @@ function appShell(){
       ${sectionContent()}
       ${modalOrder ? updateModal(modalOrder) : ''}
       ${popupOpen && actor.type==='admin' ? newOrdersPopup(unseenOrders) : ''}
+      ${withdrawalPopupOpen && actor.type==='admin' ? withdrawalRequestPopup((adminWithdrawals.pending||[]).filter(w=>!w.seenByAdmin)) : ''}
+      ${lowStockAdminPopupOpen && actor.type==='admin' ? lowStockAdminPopup() : ''}
       ${reportPopupOpen && actor.type==='store' ? sentReportPopup(mySentReports) : ''}
       ${lowStockPopupOpen && actor.type==='store' ? lowStockPopup() : ''}
       ${pwChangeOpen ? passwordChangeModal() : ''}
@@ -525,6 +596,8 @@ function sectionContent(){
   if (activeSection==='team' && perms.team) return adminTeamPanel();
   if (activeSection==='withdrawals' && perms.withdrawals) return adminWithdrawalsPanel();
   if (activeSection==='expenses' && perms.expenses) return adminExpensesPanel();
+  if (activeSection==='customers' && perms.customers) return customersPanel();
+  if (activeSection==='zones' && perms.zones) return zonesPanel();
   if (activeSection==='trash' && perms.trash) return trashPanel();
   if (activeSection==='report') return reportPanel(true, reportData.storeOptions || []);
   return '<div class="empty">Nothing to show here.</div>';
@@ -532,14 +605,20 @@ function sectionContent(){
 
 function topbar(){
   let label, extra = '';
+  const hamburger = `<button class="hamburger-btn" id="hamburger-btn" aria-label="Menu">☰</button>`;
   if (actor.type === 'store'){
-    label = `Store: <b>${escapeHtml(actor.store_name)}</b>${!actor.is_primary?' · '+escapeHtml(actor.position||'Team member'):''}`;
+    label = `${hamburger} Store: <b>${escapeHtml(actor.store_name)}</b>${!actor.is_primary?' · '+escapeHtml(actor.position||'Team member'):''}`;
   } else {
-    label = `<b>${escapeHtml(actor.name || 'Dispatch Admin')}</b>${actor.position?' · '+escapeHtml(actor.position):''} <span class="mono" style="color:var(--slate);">(${escapeHtml(actor.admin_id)})</span>`;
-    extra = `<button class="bell-btn" id="bell-btn">Check for new orders${unseenCount?`<span class="bell-count">${unseenCount}</span>`:''}</button>`;
+    label = `${hamburger} <b>${escapeHtml(actor.name || 'Dispatch Admin')}</b>${actor.position?' · '+escapeHtml(actor.position):''} <span class="mono" style="color:var(--slate);">(${escapeHtml(actor.admin_id)})</span>`;
+    const perms = actor.permissions || {};
+    const bells = [];
+    if (perms.orders) bells.push(`<button class="bell-btn" id="bell-btn">Check for new orders${unseenCount?`<span class="bell-count">${unseenCount}</span>`:''}</button>`);
+    if (perms.withdrawals) bells.push(`<button class="bell-btn" id="withdraw-bell-btn">Withdrawal requests${unseenWithdrawalCount?`<span class="bell-count">${unseenWithdrawalCount}</span>`:''}</button>`);
+    if (perms.inventory) bells.push(`<button class="bell-btn" id="lowstock-admin-bell-btn">Low stock${lowStockAdminCount?`<span class="bell-count">${lowStockAdminCount}</span>`:''}</button>`);
+    extra = bells.join('');
   }
   return `<div class="topbar">
-    <div class="session-tag">${label}</div>
+    <div class="session-tag" style="display:flex;align-items:center;gap:10px;">${label}</div>
     <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
       ${extra}<button class="pw-change-btn" id="pw-change-open-btn">Change password</button>
       <button class="logout" id="logout-btn">Log out</button>
@@ -560,8 +639,26 @@ function attachHeaderHandlers(){
       catch(e){ showToast(e.message); }
     };
   }
+  const withdrawBell = document.getElementById('withdraw-bell-btn');
+  if (withdrawBell){
+    withdrawBell.onclick = async () => {
+      try{ await checkForPendingWithdrawals(); withdrawalPopupOpen = true; render(); }
+      catch(e){ showToast(e.message); }
+    };
+  }
+  const lowStockBell = document.getElementById('lowstock-admin-bell-btn');
+  if (lowStockBell){
+    lowStockBell.onclick = async () => {
+      try{ await loadAdminData(); checkForLowStockAdmin(); lowStockAdminPopupOpen = true; render(); }
+      catch(e){ showToast(e.message); }
+    };
+  }
   const pwBtn = document.getElementById('pw-change-open-btn');
   if (pwBtn) pwBtn.onclick = () => { pwChangeOpen = true; render(); };
+  const hamburger = document.getElementById('hamburger-btn');
+  if (hamburger) hamburger.onclick = () => { sidebarOpen = !sidebarOpen; render(); };
+  const overlay = document.getElementById('sidebar-overlay');
+  if (overlay) overlay.onclick = () => { sidebarOpen = false; render(); };
 }
 function passwordChangeModal(){
   const label = actor.type === 'admin' ? `${actor.name} (${actor.admin_id})` : `${actor.store_name} (${actor.store_id})`;
@@ -644,14 +741,20 @@ function attachShellHandlers(){
   attachPasswordChangeHandlers();
 
   document.querySelectorAll('.side-item[data-section]').forEach(el=>{
-    el.onclick = async () => {
-      activeSection = el.dataset.section; onceCred=null; selectedOrderIds=new Set(); selectedInvIds=new Set(); reportDrillDay=null;
+    el.addEventListener('click', async (e) => {
+      // Real <a href="#section"> links — let Ctrl/Cmd-click, Shift-click,
+      // and middle-click behave normally (these open a new tab); only a
+      // plain left-click is intercepted to navigate instantly in-page.
+      if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+      e.preventDefault();
+      activeSection = el.dataset.section; onceCred=null; selectedOrderIds=new Set(); selectedInvIds=new Set(); reportDrillDay=null; sidebarOpen=false; showMyTrash=false; window._invDrillStore=null; window._zoneDrill=null;
       render();
       try{
         if (activeSection === 'stores' && actor.type==='admin'){ await loadResetRequests('store'); render(); }
         if (activeSection === 'team' && actor.type==='admin'){ await Promise.all([loadAdminAdmins(), loadResetRequests('admin')]); render(); }
         if (activeSection === 'withdrawals'){ await loadAdminWithdrawals(); render(); }
         if (activeSection === 'expenses'){ await loadExpenses(); render(); }
+        if (activeSection === 'customers' && actor.type==='admin'){ await loadCustomers(window._customerSearch); render(); }
         if (activeSection === 'trash'){ await loadTrash(); render(); }
         if (activeSection === 'wallet' && actor.type==='store'){ await loadWalletData(); render(); }
         if (activeSection === 'report'){
@@ -663,7 +766,7 @@ function attachShellHandlers(){
           render();
         }
       }catch(e){ showToast(e.message); }
-    };
+    });
   });
 
   attachOrdersHandlers();
@@ -674,6 +777,8 @@ function attachShellHandlers(){
   attachAdminTeamHandlers();
   attachWithdrawalsHandlers();
   attachExpensesHandlers();
+  attachCustomersHandlers();
+  attachZonesHandlers();
   attachTrashHandlers();
   attachReportHandlers(actor.type==='admin');
   attachPopupHandlers();
@@ -755,8 +860,12 @@ function statusPillRow(list, allForCounts, filterKey){
   const counts = {}; STATUSES.forEach(s=>counts[s.v]=0);
   allForCounts.forEach(o=>counts[o.status]=(counts[o.status]||0)+1);
   const allActive = filterStatus==='all';
+  // "Active" (was "All") excludes Remitted/Cancelled/Returned from the
+  // default view and its count — they're still fully reachable via their
+  // own pill below, just not cluttering the default list.
+  const activeCount = allForCounts.filter(o=>!ARCHIVED_STATUSES.includes(o.status)).length;
   return `<div class="pill-row">
-    <div class="pill" data-statfilter="all" data-statkey="${filterKey}" style="${allActive?`background:var(--ink);color:#fff;border-color:var(--ink);`:`background:#fff;color:var(--ink);border-color:var(--ink);`}">All <span class="cnt" style="${allActive?'color:#cfd8e0;':''}">(${allForCounts.length})</span></div>
+    <div class="pill" data-statfilter="all" data-statkey="${filterKey}" title="Active orders — Remitted, Cancelled and Returned have their own pills" style="${allActive?`background:var(--ink);color:#fff;border-color:var(--ink);`:`background:#fff;color:var(--ink);border-color:var(--ink);`}">Active <span class="cnt" style="${allActive?'color:#cfd8e0;':''}">(${activeCount})</span></div>
     ${STATUSES.map(s=>{ const active=filterStatus===s.v;
       return `<div class="pill" data-statfilter="${s.v}" data-statkey="${filterKey}" style="${active?`background:${s.solid};color:#fff;border-color:${s.solid};`:`background:${s.dim};color:${s.solid};border-color:${s.solid};`}">${s.label} <span class="cnt" style="${active?'color:rgba(255,255,255,.75);':`color:${s.solid};opacity:.7;`}">(${counts[s.v]})</span></div>`;
     }).join('')}
@@ -786,12 +895,29 @@ function bulkBar(isAdmin){
 }
 
 /* ---------------- STORE: ORDERS (Add Order + Orders list, combined) ---------------- */
+function storeProfileCard(){
+  const delivered = myOrders.filter(o=>o.status==='delivered'||o.status==='remitted').length;
+  return `<div class="store-profile-card">
+    <div class="store-profile-avatar">${escapeHtml((actor.store_name||'?').charAt(0).toUpperCase())}</div>
+    <div class="store-profile-info">
+      <div class="store-profile-name">${escapeHtml(actor.store_name)}</div>
+      <div class="store-profile-meta">
+        <span class="mono">${escapeHtml(actor.store_id||'')}</span>
+        ${!actor.is_primary ? `<span>· ${escapeHtml(actor.position||'Team member')}</span>` : ''}
+      </div>
+    </div>
+    <div class="store-profile-stats">
+      <div><b>${myOrders.length}</b><span>Total orders</span></div>
+      <div><b>${delivered}</b><span>Completed</span></div>
+    </div>
+  </div>`;
+}
 function storeOrdersSection(){
   const perms = storePerms();
-  let html = '';
-  if (perms.order) html += storeOrderFormPanel(myProducts);
-  if (perms.history) html += storeOrdersListPanel(myOrders);
-  return html || '<div class="empty">You do not have access to Orders.</div>';
+  let panels = '';
+  if (perms.order) panels += storeOrderFormPanel(myProducts);
+  if (perms.history) panels += storeOrdersListPanel(myOrders);
+  return storeProfileCard() + (panels || '<div class="empty">You do not have access to Orders.</div>');
 }
 function storeOrderFormPanel(availableInv){
   return `
@@ -814,7 +940,10 @@ function storeOrderFormPanel(availableInv){
         <div><label>Phone number</label><input id="f-phone" placeholder="0803 000 0000" /></div>
         <div><label>Alternate phone (optional)</label><input id="f-altphone" placeholder="Backup contact" /></div>
       </div>
-      <div class="row2">
+      <div class="row3">
+        <div><label>Delivery zone / area</label><input id="f-zone" list="zone-suggestions" placeholder="e.g. Ikeja" />
+          <datalist id="zone-suggestions">${COMMON_ZONES.map(z=>`<option value="${z}">`).join('')}</datalist>
+        </div>
         <div><label>Amount (optional)</label><input id="f-amount" type="number" min="0" placeholder="e.g. 33000" /></div>
         <div><label>Specific instructions (optional)</label><input id="f-notes" placeholder="e.g. fragile, call before arriving" /></div>
       </div>
@@ -822,12 +951,31 @@ function storeOrderFormPanel(availableInv){
       `}
     </div>`;
 }
+function customerOrderCount(phone, list){ if (!phone) return 0; return list.filter(o=>o.phone===phone).length; }
 function storeOrdersListPanel(mine){
+  if (showMyTrash){
+    const trashList = myTrash.slice().sort((a,b)=>b.updatedAt-a.updatedAt);
+    return `<div class="panel">
+      <h2><span class="dot"></span>Your Trash (${trashList.length})</h2>
+      <p class="hint">Orders you moved to Trash. Restore brings one back to your active list. Only an admin can permanently delete.</p>
+      <button class="btn-outline btn btn-sm" id="my-trash-back-btn" style="margin-bottom:14px;">← Back to your orders</button>
+      ${trashList.length ? trashList.map(o=>{
+        const sm = statusMeta(o.status);
+        return `<div class="stub">
+          <div class="stub-top"><div><div class="stub-id mono">#${escapeHtml(o.id)}</div><div class="stub-item">${escapeHtml(o.item)}${o.qty>1?' × '+o.qty:''}</div></div><span class="badge ${sm.badge}">${sm.label}</span></div>
+          <div class="stub-grid"><div><span class="k">Customer:</span> ${escapeHtml(o.customer)} · ${escapeHtml(o.phone)}</div><div><span class="k">Deliver to:</span> ${escapeHtml(o.dropoff)}</div></div>
+          <div class="modal-actions" style="justify-content:flex-start;margin-top:10px;"><button class="restore-btn" data-my-restore="${escapeHtml(o.id)}">Restore</button></div>
+        </div>`;
+      }).join('') : '<div class="empty">Your trash is empty.</div>'}
+    </div>`;
+  }
+
   const sorted = mine.slice().sort((a,b)=>b.createdAt-a.createdAt);
   const searchTerm = (window._historySearch||'').toLowerCase();
   let list = sorted;
   const filterStatus = window._historyStatFilter || 'all';
   if (filterStatus!=='all') list = list.filter(o=>o.status===filterStatus);
+  else list = list.filter(o=>!ARCHIVED_STATUSES.includes(o.status));
   if (searchTerm) list = list.filter(o=>o.customer.toLowerCase().includes(searchTerm) || o.phone.toLowerCase().includes(searchTerm) || o.id.toLowerCase().includes(searchTerm));
 
   return `<div class="panel">
@@ -836,23 +984,25 @@ function storeOrdersListPanel(mine){
     <div class="filters">
       <input id="search-history" placeholder="Search customer, phone, or order #" value="${escapeHtml(window._historySearch||'')}" />
       <button class="btn-outline btn" id="search-history-btn" style="padding:9px 14px;">Search</button>
+      <button class="btn-outline btn" id="my-trash-open-btn" style="padding:9px 14px;">🗑 Your Trash</button>
     </div>
     ${dateFilterBar('_historyDateQuick')}
     <label style="display:flex;align-items:center;gap:8px;text-transform:none;font-weight:400;font-size:12.5px;margin-bottom:10px;">
       <input type="checkbox" id="select-all-cb" style="width:auto;margin:0;" ${list.length && list.every(o=>selectedOrderIds.has(o.id))?'checked':''}> Select all shown
     </label>
     ${selectedOrderIds.size?bulkBar(false):''}
-    ${list.length ? list.map(o=>orderRowStub(o)).join('') : '<div class="empty">No orders in this range.</div>'}
+    ${list.length ? list.map(o=>orderRowStub(o, sorted)).join('') : '<div class="empty">No orders in this range.</div>'}
   </div>`;
 }
-function orderRowStub(o){
+function orderRowStub(o, allMine){
   const sm = statusMeta(o.status);
   const dCharge = (o.deliveryFee||0)+(o.otherCharges||0);
+  const repeatCount = allMine ? customerOrderCount(o.phone, allMine) : 0;
   return `<div class="stub">
     <div class="stub-top">
       <label style="display:flex;align-items:flex-start;gap:10px;text-transform:none;font-weight:400;margin:0;">
         <input type="checkbox" class="order-select-cb" data-id="${escapeHtml(o.id)}" ${selectedOrderIds.has(o.id)?'checked':''} style="width:auto;margin-top:3px;" />
-        <div><div class="stub-id mono">#${escapeHtml(o.id)}</div><div class="stub-item">${escapeHtml(o.item)}${o.qty>1?' × '+o.qty:''}</div></div>
+        <div><div class="stub-id mono">#${escapeHtml(o.id)}</div><div class="stub-item">${escapeHtml(o.item)}${o.qty>1?' × '+o.qty:''}${o.zone?` <span class="badge badge-role">📍 ${escapeHtml(o.zone)}</span>`:''}${repeatCount>1?` <span class="badge badge-ok">↻ Repeat (${repeatCount})</span>`:''}</div></div>
       </label>
       <span class="badge ${sm.badge}">${sm.label}</span>
     </div>
@@ -875,11 +1025,26 @@ function orderRowStub(o){
 function inventorySection(isStore){
   return isStore ? storeInventoryPanel(myProducts) : adminInventoryPanel();
 }
+/** Shared row renderer. isAdmin=true shows the qty +/- controls and the
+ * select checkbox (admin-only quantity edits — round 2 item #9); stores
+ * always get a view-only row plus the "last updated by/at" accountability
+ * trail, whether they're the one it's shown to or the admin confirming it. */
+function invRow(i, isAdmin){
+  const low = i.qty<=LOW_STOCK_THRESHOLD;
+  return `<div class="inv-row">
+    ${isAdmin ? `<input type="checkbox" class="inv-select-cb" data-id="${i.id}" ${selectedInvIds.has(i.id)?'checked':''} />` : '<div></div>'}
+    <div><div class="inv-name">${escapeHtml(i.name)}${isAdmin && i.store_name ? ` <span class="mono" style="color:var(--slate);font-size:11px;">${escapeHtml(i.store_name)}</span>` : ''}</div>
+      ${i.dropped_off_at ? `<div class="inv-date">Dropped off ${escapeHtml(i.dropped_off_at)}</div>` : ''}
+      ${i.qty_updated_at && i.qty_updated_by ? `<div class="inv-date">Last updated ${new Date(i.qty_updated_at.replace(' ','T')).toLocaleString()} by ${escapeHtml(i.qty_updated_by)}</div>` : ''}</div>
+    <span class="badge ${low?'badge-low':'badge-ok'}">${low ? (i.qty<=0?'Out of stock':'Low stock') : 'In stock'}</span>
+    <div class="inv-qty">${i.qty}</div>
+    <div class="inv-actions">${isAdmin ? `<button class="qty-btn" data-inv="${i.id}" data-delta="-1">−</button><button class="qty-btn" data-inv="${i.id}" data-delta="1">+</button>` : ''}</div></div>`;
+}
 function storeInventoryPanel(myInv){
   return `
     <div class="panel">
       <h2><span class="dot"></span>Log a stock drop-off</h2>
-      <p class="hint">When you bring products to us, log them here.</p>
+      <p class="hint">Once logged, only your dispatch admin can adjust the quantity — this keeps stock counts accurate against what was actually received.</p>
       <div class="row3">
         <div><label>Product name</label><input id="inv-name" placeholder="e.g. Black sneakers, size 42" /></div>
         <div><label>Quantity dropped off</label><input id="inv-qty" type="number" min="0" value="1" /></div>
@@ -888,45 +1053,43 @@ function storeInventoryPanel(myInv){
       <button class="btn" id="inv-add-btn">Log drop-off</button>
     </div>
     <div class="panel">
-      <h2><span class="dot"></span>Stock we're currently holding for you (${myInv.length})</h2>
-      ${myInv.length ? `<label style="display:flex;align-items:center;gap:8px;text-transform:none;font-weight:400;font-size:12.5px;margin-bottom:10px;">
-        <input type="checkbox" id="inv-select-all-cb" style="width:auto;margin:0;" ${myInv.every(i=>selectedInvIds.has(i.id))?'checked':''}> Select all
-      </label>` : ''}
-      ${selectedInvIds.size ? `<div class="bulkbar"><span>${selectedInvIds.size} selected</span><button class="btn btn-sm" id="inv-bulk-remove-btn">Remove selected</button><button class="btn-outline btn btn-sm" id="inv-bulk-clear-btn" style="background:none;">Clear selection</button></div>` : ''}
-      ${myInv.length ? myInv.map(invRow).join('') : '<div class="empty">Nothing logged yet.</div>'}
+      <h2><span class="dot"></span>Stock we're currently holding for you <span style="text-transform:none;font-weight:400;font-size:11px;color:var(--slate);">(view only)</span></h2>
+      ${myInv.length ? myInv.map(i=>invRow(i, false)).join('') : '<div class="empty">Nothing logged yet.</div>'}
     </div>`;
 }
-function invRow(i){
-  const low = i.qty<=LOW_STOCK_THRESHOLD;
-  return `<div class="inv-row">
-    <input type="checkbox" class="inv-select-cb" data-id="${i.id}" ${selectedInvIds.has(i.id)?'checked':''} />
-    <div><div class="inv-name">${escapeHtml(i.name)}</div>${i.dropped_off_at ? `<div class="inv-date">Dropped off ${escapeHtml(i.dropped_off_at)}</div>` : ''}</div>
-    <span class="badge ${low?'badge-low':'badge-ok'}">${low ? (i.qty<=0?'Out of stock':'Low stock') : 'In stock'}</span>
-    <div class="inv-qty">${i.qty}</div>
-    <div class="inv-actions"><button class="qty-btn" data-inv="${i.id}" data-delta="-1">−</button><button class="qty-btn" data-inv="${i.id}" data-delta="1">+</button></div></div>`;
-}
 function attachInventoryHandlers(){
-  if (actor.type!=='store') return;
-  const addInvBtn = document.getElementById('inv-add-btn');
-  if (addInvBtn){
-    addInvBtn.onclick = async () => {
-      const name = document.getElementById('inv-name').value.trim();
-      const qty = parseInt(document.getElementById('inv-qty').value, 10);
-      const droppedOffAt = document.getElementById('inv-date').value || todayStr();
-      if (!name || isNaN(qty) || qty<0){ showToast('Enter a product name and valid quantity'); return; }
-      try{
-        await api('products.php', {method:'POST', body:{name, qty, droppedOffAt}});
-        await loadStoreData();
-        showToast('Drop-off logged');
-        render();
-      }catch(e){ showToast(e.message); }
-    };
+  if (actor.type==='store'){
+    const addInvBtn = document.getElementById('inv-add-btn');
+    if (addInvBtn){
+      addInvBtn.onclick = async () => {
+        const name = document.getElementById('inv-name').value.trim();
+        const qty = parseInt(document.getElementById('inv-qty').value, 10);
+        const droppedOffAt = document.getElementById('inv-date').value || todayStr();
+        if (!name || isNaN(qty) || qty<0){ showToast('Enter a product name and valid quantity'); return; }
+        try{
+          await api('products.php', {method:'POST', body:{name, qty, droppedOffAt}});
+          await loadStoreData();
+          showToast('Drop-off logged');
+          render();
+        }catch(e){ showToast(e.message); }
+      };
+    }
+    return;
   }
+
+  // Admin: store drill-down navigation
+  document.querySelectorAll('[data-drill-inv-store]').forEach(row=>{
+    row.onclick = () => { window._invDrillStore = row.dataset.drillInvStore; selectedInvIds = new Set(); render(); };
+  });
+  const invBack = document.getElementById('inv-back-to-stores');
+  if (invBack) invBack.onclick = () => { window._invDrillStore = null; render(); };
+
+  // Admin: quantity adjustment (the server-enforced, admin-only action)
   document.querySelectorAll('.qty-btn').forEach(btn=>{
     btn.onclick = async () => {
       try{
         await api('products.php', {method:'PATCH', body:{id:parseInt(btn.dataset.inv,10), delta:parseInt(btn.dataset.delta,10)}});
-        await loadStoreData();
+        await loadAdminData();
         render();
       }catch(e){ showToast(e.message); }
     };
@@ -934,8 +1097,15 @@ function attachInventoryHandlers(){
   document.querySelectorAll('.inv-select-cb').forEach(cb=>{
     cb.onchange = () => { if (cb.checked) selectedInvIds.add(parseInt(cb.dataset.id)); else selectedInvIds.delete(parseInt(cb.dataset.id)); render(); };
   });
-  const selAll = document.getElementById('inv-select-all-cb');
-  if (selAll){ selAll.onchange = () => { if (selAll.checked) myProducts.forEach(i=>selectedInvIds.add(i.id)); else selectedInvIds.clear(); render(); }; }
+  const invSelectAll = document.getElementById('inv-select-all-cb');
+  if (invSelectAll){
+    invSelectAll.onchange = () => {
+      const drillStore = window._invDrillStore;
+      const invList = adminProducts.filter(i=>i.store_name===drillStore);
+      if (invSelectAll.checked) invList.forEach(i=>selectedInvIds.add(i.id)); else invList.forEach(i=>selectedInvIds.delete(i.id));
+      render();
+    };
+  }
   const bulkRemove = document.getElementById('inv-bulk-remove-btn');
   if (bulkRemove){
     bulkRemove.onclick = async () => {
@@ -943,7 +1113,7 @@ function attachInventoryHandlers(){
       try{
         await api('products.php', {method:'PATCH', body:{action:'bulk_delete', ids:Array.from(selectedInvIds)}});
         selectedInvIds = new Set();
-        await loadStoreData();
+        await loadAdminData();
         showToast('Removed');
         render();
       }catch(e){ showToast(e.message); }
@@ -953,18 +1123,34 @@ function attachInventoryHandlers(){
   if (bulkClear) bulkClear.onclick = () => { selectedInvIds = new Set(); render(); };
 }
 function adminInventoryPanel(){
-  const storeNames = [...new Set(adminProducts.map(i=>i.store_name))].sort();
-  const invFilterStore = window._invFilterStore || 'all';
-  let invList = adminProducts.slice().sort((a,b)=> (a.store_name+a.name).localeCompare(b.store_name+b.name));
-  if (invFilterStore!=='all') invList = invList.filter(i=>i.store_name===invFilterStore);
-  return `<div class="panel"><h2><span class="dot"></span>Inventory across stores (${invList.length})</h2>
-    <div class="filters"><select id="inv-filter-store"><option value="all">All stores</option>${storeNames.map(s=>`<option value="${escapeHtml(s)}" ${s===invFilterStore?'selected':''}>${escapeHtml(s)}</option>`).join('')}</select></div>
-    ${invList.length ? invList.map(adminInvRow).join('') : '<div class="empty">No inventory logged yet.</div>'}</div>`;
-}
-function adminInvRow(i){
-  const low = i.qty<=LOW_STOCK_THRESHOLD;
-  return `<div class="inv-row"><div><div class="inv-name">${escapeHtml(i.name)} <span class="mono" style="color:var(--slate);font-size:11px;">${escapeHtml(i.store_name)}</span></div>${i.dropped_off_at?`<div class="inv-date">Dropped off ${escapeHtml(i.dropped_off_at)}</div>`:''}</div>
-    <span class="badge ${low?'badge-low':'badge-ok'}">${low ? (i.qty<=0?'Out of stock':'Low stock') : 'In stock'}</span><div class="inv-qty">${i.qty}</div><div></div><div></div></div>`;
+  const drillStore = window._invDrillStore;
+
+  if (!drillStore){
+    const storeNames = [...new Set(adminProducts.map(i=>i.store_name))].sort();
+    const rows = storeNames.map(store=>{
+      const items = adminProducts.filter(i=>i.store_name===store);
+      const lowCount = items.filter(i=>i.qty<=LOW_STOCK_THRESHOLD).length;
+      return `<div class="day-row" data-drill-inv-store="${escapeHtml(store)}">
+        <span class="dlabel">${escapeHtml(store)}</span>
+        <span class="dcount">${items.length} product(s)${lowCount?` · ⚠ ${lowCount} low/out`:''}</span>
+        <span class="dbal">▸</span>
+      </div>`;
+    }).join('');
+    return `<div class="panel"><h2><span class="dot"></span>Inventory by store</h2>
+      <p class="hint">Click a store to see and confirm its stock — only admin can adjust quantities.</p>
+      ${storeNames.length ? rows : '<div class="empty">No inventory logged yet.</div>'}
+    </div>`;
+  }
+
+  const invList = adminProducts.filter(i=>i.store_name===drillStore).sort((a,b)=>a.name.localeCompare(b.name));
+  return `<div class="panel"><h2><span class="dot"></span>Inventory — ${escapeHtml(drillStore)} (${invList.length})</h2>
+    <button class="btn-outline btn btn-sm" id="inv-back-to-stores" style="margin-bottom:14px;">← Back to stores</button>
+    <p class="hint">Confirm quantities against what was physically received — every adjustment is logged with your name and the time.</p>
+    ${invList.length ? `<label style="display:flex;align-items:center;gap:8px;text-transform:none;font-weight:400;font-size:12.5px;margin-bottom:10px;">
+      <input type="checkbox" id="inv-select-all-cb" style="width:auto;margin:0;" ${invList.every(i=>selectedInvIds.has(i.id))?'checked':''}> Select all
+    </label>` : ''}
+    ${selectedInvIds.size ? `<div class="bulkbar"><span>${selectedInvIds.size} selected</span><button class="btn btn-sm" id="inv-bulk-remove-btn">Remove selected</button><button class="btn-outline btn btn-sm" id="inv-bulk-clear-btn" style="background:none;">Clear</button></div>` : ''}
+    ${invList.length ? invList.map(i=>invRow(i, true)).join('') : '<div class="empty">No inventory logged yet.</div>'}</div>`;
 }
 
 /* ---------------- STORE: TEAM ---------------- */
@@ -1135,6 +1321,25 @@ function lowStockPopup(){
     <div class="modal-actions"><button class="btn btn-outline" id="lowstock-close">Dismiss</button><button class="btn" id="lowstock-goto">Go to Inventory</button></div>
   </div></div>`;
 }
+function withdrawalRequestPopup(pending){
+  return `<div class="modal-overlay" id="withdraw-popup-overlay"><div class="modal">
+    <h3>💳 New withdrawal request${pending.length>1?'s':''}</h3>
+    <div class="id">${pending.length} store(s) requesting payment</div>
+    ${pending.map(w=>`<div class="new-order-item"><span class="store-tag">${escapeHtml(w.store)}</span>Requesting ${money(w.amount)}</div>`).join('')}
+    <div class="modal-actions"><button class="btn btn-outline" id="withdraw-popup-close">Close</button><button class="btn" id="withdraw-popup-goto">Go to Withdrawals</button></div>
+  </div></div>`;
+}
+function lowStockAdminPopup(){
+  const low = adminProducts.filter(i=>i.qty<=LOW_STOCK_THRESHOLD);
+  const byStore = {};
+  low.forEach(i=>{ (byStore[i.store_name] = byStore[i.store_name] || []).push(i); });
+  return `<div class="modal-overlay" id="lowstock-admin-overlay"><div class="modal">
+    <h3>⚠ ${low.length} product${low.length>1?'s':''} low or out of stock</h3>
+    <div class="id">Across ${Object.keys(byStore).length} store(s)</div>
+    ${Object.keys(byStore).map(store=>`<div class="new-order-item"><span class="store-tag">${escapeHtml(store)}</span>${byStore[store].map(i=>escapeHtml(i.name)+' ('+i.qty+')').join(', ')}</div>`).join('')}
+    <div class="modal-actions"><button class="btn btn-outline" id="lowstock-admin-close">Close</button><button class="btn" id="lowstock-admin-goto">Go to Inventory</button></div>
+  </div></div>`;
+}
 
 /* ---------------- REPORT (shared store + admin, day-grouped w/ drill-down) ---------------- */
 function formatDateRangeLabel(from, to){
@@ -1264,6 +1469,37 @@ function exportOrdersCsv(list){
   const a=document.createElement('a'); a.href=url; a.download='orders-'+todayStr()+'.csv'; a.click();
   URL.revokeObjectURL(url);
 }
+/** The admin Orders list as currently filtered/visible (status pill,
+ * search, store, date range) — shared by CSV export and the Print
+ * slips fallback (used when nothing is checkbox-selected). */
+function currentFilteredAdminOrders(){
+  const filterStatus = window._filterStatus || 'all';
+  const searchTerm = (window._searchTerm || '').toLowerCase();
+  let list = adminOrders.slice().sort((a,b)=>b.createdAt-a.createdAt);
+  if (filterStatus !== 'all') list = list.filter(o=>o.status===filterStatus);
+  else list = list.filter(o=>!ARCHIVED_STATUSES.includes(o.status));
+  if (searchTerm) list = list.filter(o=>o.customer.toLowerCase().includes(searchTerm)||o.phone.toLowerCase().includes(searchTerm)||o.id.toLowerCase().includes(searchTerm));
+  return list;
+}
+function printOrderSlips(list){
+  const area = document.getElementById('print-area');
+  if (!area) return;
+  if (!list.length){ showToast('Select at least one order to print'); return; }
+  area.innerHTML = list.map(o=>`
+    <div class="slip">
+      <div class="slip-field"><b>Date:</b> ${new Date(o.createdAt).toLocaleDateString()}</div>
+      <div class="slip-field"><b>Name:</b> ${escapeHtml(o.customer)}</div>
+      <div class="slip-field"><b>Address:</b> ${escapeHtml(o.dropoff)}</div>
+      <div class="slip-field"><b>Phone number:</b> ${escapeHtml(o.phone)}${o.altPhone?' / '+escapeHtml(o.altPhone):''}</div>
+      <table>
+        <thead><tr><th>S/N</th><th>ITEM ORDERED</th><th>AMOUNT (${appMeta.currency})</th></tr></thead>
+        <tbody><tr><td>1</td><td>${escapeHtml(o.item)}${o.qty>1?' × '+o.qty:''}</td><td>${o.amount?o.amount.toLocaleString():''}</td></tr></tbody>
+        <tfoot><tr><td colspan="2">TOTAL</td><td>${money(o.amount||0)}</td></tr></tfoot>
+      </table>
+    </div>
+  `).join('');
+  window.print();
+}
 function adminOrdersSection(){
   const storeOptions = adminAccounts.filter(a=>a.role==='owner').slice().sort((a,b)=>a.store_name.localeCompare(b.store_name));
   const filterStore = window._filterStore || 'all';
@@ -1271,13 +1507,12 @@ function adminOrdersSection(){
   let list = adminOrders.slice().sort((a,b)=>b.createdAt-a.createdAt);
   const filterStatus = window._filterStatus || 'all';
   if (filterStatus!=='all') list = list.filter(o=>o.status===filterStatus);
+  else list = list.filter(o=>!ARCHIVED_STATUSES.includes(o.status));
   if (searchTerm) list = list.filter(o=>
     o.customer.toLowerCase().includes(searchTerm) || o.phone.toLowerCase().includes(searchTerm) || o.id.toLowerCase().includes(searchTerm)
   );
-  const lowStockAll = adminProducts.filter(i=>i.qty<=LOW_STOCK_THRESHOLD);
 
   return `
-    ${lowStockAll.length ? `<div class="alert-banner">⚠ ${lowStockAll.length} product${lowStockAll.length>1?'s':''} low or out of stock: ${lowStockAll.map(i=>escapeHtml(i.store_name)+' — '+escapeHtml(i.name)+' ('+i.qty+')').join(', ')}</div>` : ''}
     <div class="panel">
       <h2><span class="dot"></span>All orders (${list.length})</h2>
       ${statusPillRow(list, adminOrders, '_filterStatus')}
@@ -1286,36 +1521,42 @@ function adminOrdersSection(){
         <button class="btn-outline btn" id="search-btn" style="padding:9px 14px;">Search</button>
         <select id="filter-store"><option value="all">All stores</option>${storeOptions.map(s=>`<option value="${escapeHtml(s.store_id)}" ${s.store_id===filterStore?'selected':''}>${escapeHtml(s.store_name)}</option>`).join('')}</select>
         <button class="btn-outline btn" id="export-csv-btn" style="padding:9px 14px;">Export CSV</button>
+        <button class="btn-outline btn" id="print-slips-btn" style="padding:9px 14px;">Print slips</button>
       </div>
       ${dateFilterBar('_ordersDateQuick')}
       <label style="display:flex;align-items:center;gap:8px;text-transform:none;font-weight:400;font-size:12.5px;margin-bottom:10px;">
         <input type="checkbox" id="select-all-cb" style="width:auto;margin:0;" ${list.length && list.every(o=>selectedOrderIds.has(o.id))?'checked':''}> Select all shown
       </label>
       ${selectedOrderIds.size?bulkBar(true):''}
-      ${list.length ? list.map(adminRow).join('') : '<div class="empty">No orders match this filter.</div>'}
+      ${list.length ? list.map(o=>adminRow(o, adminOrders)).join('') : '<div class="empty">No orders match this filter.</div>'}
     </div>`;
 }
-function adminRow(o){
+function adminRow(o, allForRepeat){
   const sm = statusMeta(o.status);
   const total = (o.deliveryFee||0)+(o.otherCharges||0);
   const canRestock = (o.status==='cancelled' || o.status==='issue' || o.status==='returned') && !o.restocked;
+  const repeatCount = allForRepeat ? customerOrderCount(o.phone, allForRepeat) : 0;
   return `<div class="admin-row" style="grid-template-columns:auto auto 1.3fr auto auto auto auto;">
     <input type="checkbox" class="order-select-cb" data-id="${escapeHtml(o.id)}" ${selectedOrderIds.has(o.id)?'checked':''} style="width:auto;margin:0;transform:scale(1.2);" />
     <div class="admin-store">${escapeHtml(o.store)}</div>
-    <div class="admin-main"><div class="item">${escapeHtml(o.item)}${o.qty>1?' × '+o.qty:''} <span class="mono" style="color:var(--slate);font-size:11px;">#${escapeHtml(o.id)}</span></div>
+    <div class="admin-main"><div class="item">${escapeHtml(o.item)}${o.qty>1?' × '+o.qty:''} <span class="mono" style="color:var(--slate);font-size:11px;">#${escapeHtml(o.id)}</span>${o.zone?` <span class="badge badge-role">📍 ${escapeHtml(o.zone)}</span>`:''}${repeatCount>1?` <span class="badge badge-ok">↻ Repeat (${repeatCount})</span>`:''}</div>
     <div class="sub">${escapeHtml(o.customer)} · ${escapeHtml(o.phone)}${o.altPhone?' / '+escapeHtml(o.altPhone):''} — to ${escapeHtml(o.dropoff)}${o.lastUpdatedBy?' · by '+escapeHtml(o.lastUpdatedBy):''}</div></div>
     <span class="badge ${sm.badge}">${sm.label}</span>
     <div class="admin-charges">${total ? `<b>${money(total)}</b>` : '—'}</div>
     <div>${canRestock ? `<button class="restock-btn" data-restock="${escapeHtml(o.id)}">Restock</button>` : (o.restocked ? '<span style="font-size:10px;color:var(--slate);">restocked</span>' : '')}</div>
-    <div style="display:flex;gap:6px;">
+    <div style="display:flex;gap:6px;flex-wrap:wrap;">
       <button class="admin-update-btn" data-id="${escapeHtml(o.id)}">Update</button>
+      ${o.prevStatus?`<button class="undo-btn" data-undo="${escapeHtml(o.id)}" title="Reverse back to ${statusMeta(o.prevStatus).label}">Undo</button>`:''}
       <button class="danger-btn" data-admin-trash="${escapeHtml(o.id)}">Trash</button>
     </div></div>`;
 }
 function updateModal(o){
+  const isDelivered = o.status === 'delivered';
+  const statusOptions = isDelivered ? STATUSES.filter(s=>s.v==='delivered'||s.v==='remitted') : STATUSES;
   return `<div class="modal-overlay" id="modal-overlay"><div class="modal">
     <h3>${escapeHtml(o.item)}${o.qty>1?' × '+o.qty:''}</h3><div class="id mono">#${escapeHtml(o.id)} · ${escapeHtml(o.store)}</div>
-    <label>Status</label><select id="modal-status">${STATUSES.map(s=>`<option value="${s.v}" ${s.v===o.status?'selected':''}>${s.label}</option>`).join('')}</select>
+    <label>Status</label><select id="modal-status">${statusOptions.map(s=>`<option value="${s.v}" ${s.v===o.status?'selected':''}>${s.label}</option>`).join('')}</select>
+    ${isDelivered?`<p class="hint" style="margin-bottom:16px;">This order is Delivered — from here it can only move forward to Remitted. If it was marked Delivered by mistake, close this and use the <b>Undo</b> button on the order instead.</p>`:''}
     <label>Rider / driver (optional)</label><input id="modal-rider" value="${escapeHtml(o.rider||'')}" placeholder="e.g. Tunde" />
     <div class="row2"><div><label>Delivery fee</label><input id="modal-delivery-fee" type="number" min="0" value="${o.deliveryFee||0}" /></div>
     <div><label>Other charges</label><input id="modal-other-charges" type="number" min="0" value="${o.otherCharges||0}" /></div></div>
@@ -1347,6 +1588,7 @@ function attachOrdersHandlers(){
         const phone = document.getElementById('f-phone').value.trim();
         const altPhone = document.getElementById('f-altphone').value.trim();
         const dropoff = document.getElementById('f-dropoff').value.trim();
+        const zone = document.getElementById('f-zone').value.trim();
         const notes = document.getElementById('f-notes').value.trim();
         const amount = parseFloat(document.getElementById('f-amount').value) || 0;
         const qty = parseInt(document.getElementById('f-qty').value, 10) || 1;
@@ -1354,7 +1596,7 @@ function attachOrdersHandlers(){
         if (qty < 1){ showToast('Quantity must be at least 1'); return; }
         busy = true; render();
         try{
-          await api('orders.php', {method:'POST', body:{product_id:productId, customer, phone, altPhone, dropoff, notes, amount, qty}});
+          await api('orders.php', {method:'POST', body:{product_id:productId, customer, phone, altPhone, dropoff, zone, notes, amount, qty}});
           await loadStoreData();
           showToast('Order submitted — stock updated');
         }catch(e){ showToast(e.message); }
@@ -1377,6 +1619,26 @@ function attachOrdersHandlers(){
         }catch(e){ showToast(e.message); }
       };
     });
+
+    const myTrashOpenBtn = document.getElementById('my-trash-open-btn');
+    if (myTrashOpenBtn){
+      myTrashOpenBtn.onclick = async () => {
+        try{ await loadMyTrash(); showMyTrash = true; render(); }
+        catch(e){ showToast(e.message); }
+      };
+    }
+    const myTrashBackBtn = document.getElementById('my-trash-back-btn');
+    if (myTrashBackBtn) myTrashBackBtn.onclick = () => { showMyTrash = false; render(); };
+    document.querySelectorAll('[data-my-restore]').forEach(btn=>{
+      btn.onclick = async () => {
+        try{
+          await api('orders.php', {method:'PATCH', body:{action:'restore', id:btn.dataset.myRestore}});
+          await loadMyTrash(); await reloadStoreOrdersWithDate();
+          showToast('Order restored');
+          render();
+        }catch(e){ showToast(e.message); }
+      };
+    });
   } else {
     attachDateFilterHandlers('_ordersDateQuick', reloadAdminOrdersWithDate);
     const fs = document.getElementById('filter-store');
@@ -1386,13 +1648,14 @@ function attachOrdersHandlers(){
     const searchBtn = document.getElementById('search-btn');
     if (searchBtn) searchBtn.onclick = () => render();
     const exportBtn = document.getElementById('export-csv-btn');
-    if (exportBtn) exportBtn.onclick = () => exportOrdersCsv(adminOrders.slice().sort((a,b)=>b.createdAt-a.createdAt).filter(o=>{
-      const filterStatus = window._filterStatus||'all';
-      const searchTerm = (window._searchTerm||'').toLowerCase();
-      if (filterStatus!=='all' && o.status!==filterStatus) return false;
-      if (searchTerm && !(o.customer.toLowerCase().includes(searchTerm)||o.phone.toLowerCase().includes(searchTerm)||o.id.toLowerCase().includes(searchTerm))) return false;
-      return true;
-    }));
+    if (exportBtn) exportBtn.onclick = () => exportOrdersCsv(currentFilteredAdminOrders());
+    const printBtn = document.getElementById('print-slips-btn');
+    if (printBtn){
+      printBtn.onclick = () => {
+        const selected = adminOrders.filter(o=>selectedOrderIds.has(o.id));
+        printOrderSlips(selected.length ? selected : currentFilteredAdminOrders());
+      };
+    }
 
     document.querySelectorAll('.admin-update-btn[data-id]').forEach(btn=>{
       btn.onclick = () => { modalOrder = adminOrders.find(o=>o.id===btn.dataset.id); render(); };
@@ -1404,6 +1667,16 @@ function attachOrdersHandlers(){
           await reloadAdminOrdersWithDate();
           await loadAdminData();
           showToast('Stock restored to inventory');
+          render();
+        }catch(e){ showToast(e.message); }
+      };
+    });
+    document.querySelectorAll('.undo-btn[data-undo]').forEach(btn=>{
+      btn.onclick = async () => {
+        try{
+          await api('orders.php', {method:'PATCH', body:{action:'undo', id:btn.dataset.undo}});
+          await reloadAdminOrdersWithDate();
+          showToast('Order reversed');
           render();
         }catch(e){ showToast(e.message); }
       };
@@ -1445,8 +1718,8 @@ function attachOrdersHandlers(){
           showToast(`${ids.length} order(s) moved to Trash`);
         } else if (action.startsWith('status:')){
           const status = action.split(':')[1];
-          await api('orders.php', {method:'PATCH', body:{action:'bulk_status', ids, status}});
-          showToast(`${ids.length} order(s) updated`);
+          const r = await api('orders.php', {method:'PATCH', body:{action:'bulk_status', ids, status}});
+          showToast(r.skipped ? `${r.updated} order(s) updated, ${r.skipped} skipped (Delivered can only move to Delivered/Remitted)` : `${r.updated} order(s) updated`);
         }
         selectedOrderIds = new Set();
         if (actor.type==='store') await reloadStoreOrdersWithDate(); else await reloadAdminOrdersWithDate();
@@ -1760,6 +2033,92 @@ function attachExpensesHandlers(){
   });
 }
 
+/* ---------------- ADMIN: CUSTOMERS (repeat-customer tracking) ---------------- */
+function customersPanel(){
+  return `<div class="panel"><h2><span class="dot"></span>Customers (${adminCustomers.length})</h2>
+    <p class="hint">Tracked by phone number across every store — spot repeat customers and how much they've ordered in total.</p>
+    <div class="filters">
+      <input id="customer-search" placeholder="Search name or phone" value="${escapeHtml(window._customerSearch||'')}" />
+      <button class="btn-outline btn" id="customer-search-btn" style="padding:9px 14px;">Search</button>
+    </div>
+    ${adminCustomers.length ? adminCustomers.map(c=>`
+      <div class="admin-row" style="grid-template-columns:1.3fr auto auto auto;">
+        <div class="admin-main"><div class="item">${escapeHtml(c.name)}${c.repeat?' <span class="badge badge-ok">↻ Repeat</span>':''}</div>
+        <div class="sub">${escapeHtml(c.phone)} · Ordered from: ${escapeHtml(c.stores)}</div></div>
+        <div style="font-weight:900;">${c.orderCount} order${c.orderCount>1?'s':''}</div>
+        <div style="font-weight:900;">${money(c.totalAmount)}</div>
+        <div style="font-size:11px;color:var(--slate);">Last: ${new Date(c.lastOrderAt).toLocaleDateString()}</div>
+      </div>
+    `).join('') : '<div class="empty">No customers yet.</div>'}
+  </div>`;
+}
+function attachCustomersHandlers(){
+  if (actor.type!=='admin') return;
+  const search = document.getElementById('customer-search');
+  if (search){
+    search.oninput = e=>{ window._customerSearch = e.target.value; };
+    search.addEventListener('keydown', async e=>{ if (e.key==='Enter'){ try{ await loadCustomers(window._customerSearch); render(); }catch(err){ showToast(err.message); } } });
+  }
+  const searchBtn = document.getElementById('customer-search-btn');
+  if (searchBtn) searchBtn.onclick = async () => { try{ await loadCustomers(window._customerSearch); render(); }catch(e){ showToast(e.message); } };
+}
+
+/* ---------------- ADMIN: DELIVERY ZONES ---------------- */
+function zonesPanel(){
+  const drillZone = window._zoneDrill;
+  const active = adminOrders.filter(o=>!o.deleted && !ARCHIVED_STATUSES.includes(o.status));
+
+  if (!drillZone){
+    const byZone = {};
+    active.forEach(o=>{ const z = o.zone || 'Unspecified'; (byZone[z] = byZone[z] || []).push(o); });
+    const zones = Object.keys(byZone).sort((a,b)=>byZone[b].length-byZone[a].length);
+    return `<div class="panel"><h2><span class="dot"></span>Delivery zones</h2>
+      <p class="hint">Active orders grouped by delivery area — click a zone to plan routes or batch nearby drops.</p>
+      ${zones.length ? zones.map(z=>`<div class="day-row" data-drill-zone="${escapeHtml(z)}">
+        <span class="dlabel">📍 ${escapeHtml(z)}</span><span class="dcount">${byZone[z].length} active order(s)</span><span class="dbal">▸</span>
+      </div>`).join('') : '<div class="empty">No active orders yet.</div>'}
+    </div>`;
+  }
+
+  const list = active.filter(o=>(o.zone||'Unspecified')===drillZone);
+  return `<div class="panel"><h2><span class="dot"></span>Zone — ${escapeHtml(drillZone)} (${list.length})</h2>
+    <button class="btn-outline btn btn-sm" id="zone-back-btn" style="margin-bottom:14px;">← Back to zones</button>
+    ${list.length ? list.map(o=>adminRow(o, adminOrders)).join('') : '<div class="empty">No orders in this zone.</div>'}
+  </div>`;
+}
+function attachZonesHandlers(){
+  if (actor.type!=='admin') return;
+  document.querySelectorAll('[data-drill-zone]').forEach(row=>{
+    row.onclick = () => { window._zoneDrill = row.dataset.drillZone; render(); };
+  });
+  const backBtn = document.getElementById('zone-back-btn');
+  if (backBtn) backBtn.onclick = () => { window._zoneDrill = null; render(); };
+  if (!window._zoneDrill) return;
+  // The zone-drill detail view reuses adminRow (Update/Undo/Trash), so it
+  // needs the same row-level handlers the main Orders section attaches.
+  document.querySelectorAll('.admin-update-btn[data-id]').forEach(btn=>{
+    btn.onclick = () => { modalOrder = adminOrders.find(o=>o.id===btn.dataset.id); render(); };
+  });
+  document.querySelectorAll('.undo-btn[data-undo]').forEach(btn=>{
+    btn.onclick = async () => {
+      try{ await api('orders.php', {method:'PATCH', body:{action:'undo', id:btn.dataset.undo}}); await loadAdminData(); showToast('Order reversed'); render(); }
+      catch(e){ showToast(e.message); }
+    };
+  });
+  document.querySelectorAll('[data-admin-trash]').forEach(btn=>{
+    btn.onclick = async () => {
+      try{ await api('orders.php', {method:'PATCH', body:{action:'trash', id:btn.dataset.adminTrash}}); await loadAdminData(); showToast('Moved to Trash'); render(); }
+      catch(e){ showToast(e.message); }
+    };
+  });
+  document.querySelectorAll('.restock-btn[data-restock]').forEach(btn=>{
+    btn.onclick = async () => {
+      try{ await api('orders.php', {method:'PATCH', body:{id: btn.dataset.restock, action:'restock'}}); await loadAdminData(); showToast('Stock restored to inventory'); render(); }
+      catch(e){ showToast(e.message); }
+    };
+  });
+}
+
 /* ---------------- ADMIN: DELETED ORDERS (TRASH) ---------------- */
 function trashPanel(){
   const list = adminTrash.slice().sort((a,b)=>b.updatedAt-a.updatedAt);
@@ -1820,6 +2179,9 @@ function attachPopupHandlers(){
       const deliveryFee = parseFloat(document.getElementById('modal-delivery-fee').value) || 0;
       const otherCharges = parseFloat(document.getElementById('modal-other-charges').value) || 0;
       const chargeNote = document.getElementById('modal-charge-note').value.trim();
+      if (status === 'delivered' && deliveryFee <= 0){
+        if (!confirm('This order has no delivery fee attached. Continue moving it to Delivered anyway?')) return;
+      }
       busy = true; render();
       try{
         await api('orders.php', {method:'PATCH', body:{id: modalOrder.id, status, rider, remark, deliveryFee, otherCharges, chargeNote}});
@@ -1840,7 +2202,7 @@ function attachPopupHandlers(){
         try{
           await api('unseen.php', {method:'POST', body:{action:'mark_seen'}});
           unseenCount = 0; unseenOrders = []; popupOpen = false;
-          patchBellBadge(); render();
+          patchBellBadges(); render();
         }catch(e){ showToast(e.message); }
       };
     }
@@ -1860,6 +2222,21 @@ function attachPopupHandlers(){
     const gotoBtn = document.getElementById('lowstock-goto');
     if (gotoBtn) gotoBtn.onclick = () => { lowStockPopupOpen=false; activeSection='inventory'; render(); };
     lowOverlay.addEventListener('click', e => { if (e.target.id==='lowstock-overlay'){ lowStockPopupOpen=false; render(); } });
+  }
+  const withdrawOverlay = document.getElementById('withdraw-popup-overlay');
+  if (withdrawOverlay){
+    const markSeen = async () => {
+      try{ await api('withdrawals.php', {method:'POST', body:{action:'mark_seen'}}); unseenWithdrawalCount = 0; }catch(e){}
+    };
+    document.getElementById('withdraw-popup-close').onclick = async () => { await markSeen(); withdrawalPopupOpen=false; render(); };
+    document.getElementById('withdraw-popup-goto').onclick = async () => { await markSeen(); withdrawalPopupOpen=false; activeSection='withdrawals'; render(); };
+    withdrawOverlay.addEventListener('click', e => { if (e.target.id==='withdraw-popup-overlay'){ withdrawalPopupOpen=false; render(); } });
+  }
+  const lowAdminOverlay = document.getElementById('lowstock-admin-overlay');
+  if (lowAdminOverlay){
+    document.getElementById('lowstock-admin-close').onclick = () => { lowStockAdminPopupOpen=false; render(); };
+    document.getElementById('lowstock-admin-goto').onclick = () => { lowStockAdminPopupOpen=false; activeSection='inventory'; window._invDrillStore=null; render(); };
+    lowAdminOverlay.addEventListener('click', e => { if (e.target.id==='lowstock-admin-overlay'){ lowStockAdminPopupOpen=false; render(); } });
   }
 }
 
