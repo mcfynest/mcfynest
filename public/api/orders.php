@@ -8,6 +8,10 @@ $method = $_SERVER['REQUEST_METHOD'];
 
 const ORDER_STATUSES = ['pending', 'scheduled', 'shipped', 'transit', 'delivered', 'remitted', 'notpicking', 'issue', 'returned', 'cancelled'];
 const RESTOCK_ELIGIBLE_STATUSES = ['cancelled', 'issue', 'returned'];
+// Once an order is Delivered, a direct status change may only move it
+// forward to Remitted — reversing it back to an earlier status goes
+// through the dedicated 'undo' action instead, never a regular update.
+const POST_DELIVERED_ALLOWED_STATUSES = ['delivered', 'remitted'];
 
 function order_row_for_client(array $o): array
 {
@@ -21,9 +25,11 @@ function order_row_for_client(array $o): array
         'phone' => $o['phone'],
         'altPhone' => $o['alt_phone'],
         'dropoff' => $o['delivery_address'],
+        'zone' => $o['zone'],
         'notes' => $o['instructions'],
         'amount' => (float) $o['amount'],
         'status' => $o['status'],
+        'prevStatus' => $o['prev_status'],
         'deleted' => (bool) $o['deleted'],
         'rider' => $o['rider'],
         'remark' => $o['dispatch_note'],
@@ -79,14 +85,25 @@ if ($method === 'GET') {
     }
 
     // Store actor (owner or team member) — both see every order for
-    // their store, gated only by the "history" permission. Stores never
-    // see their own trash query (trash is admin-only).
-    require_store_permission($pdo, $actor, 'history');
-    $sql = 'SELECT o.*, s.store_name FROM orders o JOIN stores s ON s.id = o.store_id
-            WHERE o.store_id = ? AND o.deleted = 0';
-    $params = [$actor['owner_row_id']];
-    apply_date_range($sql, $params, 'o.created_at');
-    $sql .= ' ORDER BY o.created_at DESC LIMIT 1000';
+    // their store. Viewing the store's own trashed orders (so they can
+    // self-restore a mistaken delete) is gated on the 'order' permission
+    // — the same permission that governs moving an order to Trash in the
+    // first place. Viewing normal order history stays gated on 'history'.
+    if ($wantTrash) {
+        require_store_permission($pdo, $actor, 'order');
+        $sql = 'SELECT o.*, s.store_name FROM orders o JOIN stores s ON s.id = o.store_id
+                WHERE o.store_id = ? AND o.deleted = 1';
+        $params = [$actor['owner_row_id']];
+        apply_date_range($sql, $params, 'o.updated_at');
+        $sql .= ' ORDER BY o.updated_at DESC LIMIT 1000';
+    } else {
+        require_store_permission($pdo, $actor, 'history');
+        $sql = 'SELECT o.*, s.store_name FROM orders o JOIN stores s ON s.id = o.store_id
+                WHERE o.store_id = ? AND o.deleted = 0';
+        $params = [$actor['owner_row_id']];
+        apply_date_range($sql, $params, 'o.created_at');
+        $sql .= ' ORDER BY o.created_at DESC LIMIT 1000';
+    }
 
     $stmt = $pdo->prepare($sql);
     $stmt->execute($params);
@@ -105,6 +122,7 @@ if ($method === 'POST') {
     $phone = str_field($body, 'phone');
     $altPhone = str_field($body, 'altPhone');
     $dropoff = str_field($body, 'dropoff');
+    $zone = str_field($body, 'zone');
     $notes = str_field($body, 'notes');
     $amount = max(0, num_field($body, 'amount', 0));
     $qty = max(1, (int) num_field($body, 'qty', 1));
@@ -132,11 +150,11 @@ if ($method === 'POST') {
 
         $orderCode = generate_order_code($pdo);
         $stmt = $pdo->prepare('INSERT INTO orders
-            (order_code, store_id, placed_by_store_id, product_id, product_name, qty, customer_name, phone, alt_phone, delivery_address, instructions, amount)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+            (order_code, store_id, placed_by_store_id, product_id, product_name, qty, customer_name, phone, alt_phone, delivery_address, zone, instructions, amount)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
         $stmt->execute([
             $orderCode, $actor['owner_row_id'], $actor['row_id'], $productId, $product['name'], $qty,
-            $customer, $phone, $altPhone ?: null, $dropoff, $notes, $amount,
+            $customer, $phone, $altPhone ?: null, $dropoff, $zone ?: null, $notes, $amount,
         ]);
 
         $pdo->commit();
@@ -155,8 +173,8 @@ if ($method === 'PATCH') {
     $action = str_field($body, 'action');
 
     // Move to Trash (soft-delete) — a store can trash its own orders,
-    // an admin can trash any order. Restoring/permanent-delete stay
-    // admin-only (gated on 'trash') below.
+    // an admin can trash any order. Permanent delete stays admin-only
+    // (gated on 'trash') below.
     if ($action === 'trash' || $action === 'delete') {
         $orderCode = str_field($body, 'id');
         if ($orderCode === '') {
@@ -195,7 +213,11 @@ if ($method === 'PATCH') {
         json_response(['ok' => true]);
     }
 
-    // Bulk status change
+    // Bulk status change — each order's prev_status is set to whatever
+    // ITS OWN status was before this change (not a single shared value),
+    // and only when that order actually changes status. Orders currently
+    // Delivered are silently skipped if the target status isn't
+    // Delivered/Remitted, rather than failing the whole batch.
     if ($action === 'bulk_status') {
         $ids = array_values(array_filter(array_map('strval', $body['ids'] ?? [])));
         $status = str_field($body, 'status');
@@ -212,26 +234,105 @@ if ($method === 'PATCH') {
         $stmt->execute([$actor['row_id']]);
         $adminName = (string) $stmt->fetchColumn();
 
-        $placeholders = implode(',', array_fill(0, count($ids), '?'));
-        $pdo->prepare("UPDATE orders SET status = ?, last_updated_by_name = ?, updated_at = CURRENT_TIMESTAMP WHERE order_code IN ($placeholders) AND deleted = 0")
-            ->execute(array_merge([$status, $adminName], $ids));
-        json_response(['ok' => true]);
+        $updated = 0;
+        $skipped = 0;
+        $pdo->beginTransaction();
+        try {
+            $placeholders = implode(',', array_fill(0, count($ids), '?'));
+            $stmt = $pdo->prepare("SELECT order_code, status FROM orders WHERE order_code IN ($placeholders) AND deleted = 0 FOR UPDATE");
+            $stmt->execute($ids);
+            $rows = $stmt->fetchAll();
+
+            $upd = $pdo->prepare('UPDATE orders SET status = ?, prev_status = ?, last_updated_by_name = ?, updated_at = CURRENT_TIMESTAMP WHERE order_code = ?');
+            foreach ($rows as $row) {
+                $current = $row['status'];
+                if ($current === $status) {
+                    continue;
+                }
+                if ($current === 'delivered' && !in_array($status, POST_DELIVERED_ALLOWED_STATUSES, true)) {
+                    $skipped++;
+                    continue;
+                }
+                $upd->execute([$status, $current, $adminName, $row['order_code']]);
+                $updated++;
+            }
+            $pdo->commit();
+        } catch (Throwable $e) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            throw $e;
+        }
+        json_response(['ok' => true, 'updated' => $updated, 'skipped' => $skipped]);
     }
 
-    // Restore from Trash (admin-only)
+    // Restore from Trash — a store can restore its own order (self-service
+    // fix for an accidental trash click); an admin with 'trash' permission
+    // can restore any order.
     if ($action === 'restore') {
-        require_admin();
-        require_admin_permission($pdo, $actor, 'trash');
         $orderCode = str_field($body, 'id');
         if ($orderCode === '') {
             json_error('Missing order id.', 400);
         }
-        $stmt = $pdo->prepare('UPDATE orders SET deleted = 0, updated_at = CURRENT_TIMESTAMP WHERE order_code = ?');
-        $stmt->execute([$orderCode]);
+        if ($actor['type'] === 'store') {
+            require_store_permission($pdo, $actor, 'order');
+            $stmt = $pdo->prepare('UPDATE orders SET deleted = 0, updated_at = CURRENT_TIMESTAMP WHERE order_code = ? AND store_id = ?');
+            $stmt->execute([$orderCode, $actor['owner_row_id']]);
+        } else {
+            require_admin();
+            require_admin_permission($pdo, $actor, 'trash');
+            $stmt = $pdo->prepare('UPDATE orders SET deleted = 0, updated_at = CURRENT_TIMESTAMP WHERE order_code = ?');
+            $stmt->execute([$orderCode]);
+        }
         if ($stmt->rowCount() === 0) {
             json_error('Order not found.', 404);
         }
         json_response(['ok' => true]);
+    }
+
+    // Undo — reverses an order back to whatever status it had
+    // immediately before its last change. Dispatch-status changes are
+    // an admin-only capability everywhere else (Update modal, bulk
+    // status change), so reversing one is admin-only too; a store never
+    // sets an order's dispatch status in the first place, so there is
+    // never a store-caused status change for it to undo. (A store's own
+    // mistake — accidentally moving an order to Trash — is undone via
+    // the 'restore' action above instead.)
+    if ($action === 'undo') {
+        require_admin();
+        require_admin_permission($pdo, $actor, 'orders');
+        $orderCode = str_field($body, 'id');
+        if ($orderCode === '') {
+            json_error('Missing order id.', 400);
+        }
+
+        $stmt = $pdo->prepare('SELECT name FROM admin_accounts WHERE id = ?');
+        $stmt->execute([$actor['row_id']]);
+        $adminName = (string) $stmt->fetchColumn();
+
+        $pdo->beginTransaction();
+        try {
+            $stmt = $pdo->prepare('SELECT id, prev_status FROM orders WHERE order_code = ? AND deleted = 0 FOR UPDATE');
+            $stmt->execute([$orderCode]);
+            $order = $stmt->fetch();
+            if (!$order) {
+                $pdo->rollBack();
+                json_error('Order not found.', 404);
+            }
+            if (!$order['prev_status']) {
+                $pdo->rollBack();
+                json_error('Nothing to undo for this order.', 400);
+            }
+            $pdo->prepare('UPDATE orders SET status = ?, prev_status = NULL, last_updated_by_name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+                ->execute([$order['prev_status'], $adminName, $order['id']]);
+            $pdo->commit();
+        } catch (Throwable $e) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            throw $e;
+        }
+        json_response(['ok' => true, 'status' => $order['prev_status']]);
     }
 
     // Restock: a manual, one-time action on a cancelled/issue/returned
@@ -298,16 +399,35 @@ if ($method === 'PATCH') {
     $otherCharges = max(0, num_field($body, 'otherCharges', 0));
     $chargeNote = str_field($body, 'chargeNote');
 
-    $stmt = $pdo->prepare('UPDATE orders SET status=?, rider=?, dispatch_note=?, delivery_fee=?, other_charges=?, charge_note=?, last_updated_by_name=? WHERE order_code=?');
-    $stmt->execute([$status, $rider, $remark, $deliveryFee, $otherCharges, $chargeNote, $adminName, $orderCode]);
-
-    if ($stmt->rowCount() === 0) {
-        // rowCount 0 can also mean "matched but nothing changed" — confirm existence.
-        $check = $pdo->prepare('SELECT 1 FROM orders WHERE order_code = ?');
-        $check->execute([$orderCode]);
-        if (!$check->fetchColumn()) {
+    $pdo->beginTransaction();
+    try {
+        $stmt = $pdo->prepare('SELECT id, status FROM orders WHERE order_code = ? FOR UPDATE');
+        $stmt->execute([$orderCode]);
+        $existing = $stmt->fetch();
+        if (!$existing) {
+            $pdo->rollBack();
             json_error('Order not found.', 404);
         }
+        $currentStatus = $existing['status'];
+
+        if ($currentStatus === 'delivered' && !in_array($status, POST_DELIVERED_ALLOWED_STATUSES, true)) {
+            $pdo->rollBack();
+            json_error('A Delivered order can only move to Delivered or Remitted here — use Undo on the order to reverse it instead.', 400);
+        }
+
+        if ($status !== $currentStatus) {
+            $stmt = $pdo->prepare('UPDATE orders SET status=?, prev_status=?, rider=?, dispatch_note=?, delivery_fee=?, other_charges=?, charge_note=?, last_updated_by_name=? WHERE order_code=?');
+            $stmt->execute([$status, $currentStatus, $rider, $remark, $deliveryFee, $otherCharges, $chargeNote, $adminName, $orderCode]);
+        } else {
+            $stmt = $pdo->prepare('UPDATE orders SET status=?, rider=?, dispatch_note=?, delivery_fee=?, other_charges=?, charge_note=?, last_updated_by_name=? WHERE order_code=?');
+            $stmt->execute([$status, $rider, $remark, $deliveryFee, $otherCharges, $chargeNote, $adminName, $orderCode]);
+        }
+        $pdo->commit();
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        throw $e;
     }
 
     json_response(['ok' => true]);
