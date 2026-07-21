@@ -207,12 +207,16 @@ table.report tfoot td{font-weight:900;border-top:2px solid var(--ink);border-bot
 .store-profile-stats b{display:block;font-size:20px;font-weight:900;}
 .store-profile-stats span{font-size:10px;color:#B9CBDB;text-transform:uppercase;letter-spacing:.05em;}
 
-/* --- Round 2: printable order slips --- */
+/* --- Round 2/3: printable order slips ---
+   Round 3 replaces the old visibility:hidden isolation trick (unreliable
+   across browsers/printers — some printed the entire multi-page app UI
+   alongside the slip) with a straightforward display:none swap: hide the
+   whole app shell and toast, show only the dedicated print area. */
 .print-only{display:none;}
 @media print{
-  body *{visibility:hidden;}
-  .print-only, .print-only *{visibility:visible;}
-  .print-only{display:block;position:absolute;top:0;left:0;width:100%;}
+  #root{display:none !important;}
+  .toast{display:none !important;}
+  .print-only{display:block !important;}
 }
 .slip{border:1px solid #000;padding:14px;margin-bottom:22px;page-break-inside:avoid;font-family:Arial, sans-serif;color:#000;}
 .slip .slip-field{margin-bottom:4px;font-size:13px;}
@@ -222,3 +226,13 @@ table.report tfoot td{font-weight:900;border-top:2px solid var(--ink);border-bot
 /* --- Round 2: undo button + zone tag --- */
 .undo-btn{background:none;border:1.5px solid var(--blue);color:var(--blue);padding:6px 10px;border-radius:4px;font-size:10.5px;font-weight:800;text-transform:uppercase;cursor:pointer;}
 .undo-btn:hover{background:var(--blue);color:#fff;}
+
+/* --- Round 3: group the order-row checkbox with the store tag, so on
+   mobile (where .admin-row collapses to one column) the two stay tied
+   together in a small row instead of the checkbox stacking onto its own
+   isolated line. --- */
+.order-row-check-group{display:flex;align-items:center;gap:8px;}
+.order-row-check-group input[type=checkbox]{width:auto;margin:0;transform:scale(1.2);}
+
+/* --- Round 3: reserved/backorder inventory + order indicators --- */
+.stock-note{font-size:10px;color:var(--slate);margin-top:2px;}

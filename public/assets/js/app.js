@@ -106,6 +106,7 @@ let pollTimer = null;
 let idleTimer = null;
 let lastActivityAt = Date.now();
 
+function availableQty(i){ return i.available!=null ? i.available : i.qty; }
 function money(n){ n = Number(n)||0; return n ? appMeta.currency + n.toLocaleString() : appMeta.currency + '0'; }
 function escapeHtml(str){
   return String(str).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
@@ -297,7 +298,7 @@ async function checkForPendingWithdrawals(){
 }
 function checkForLowStockAdmin(){
   if (!(actor.permissions || {}).inventory) return;
-  const low = adminProducts.filter(i=>i.qty<=LOW_STOCK_THRESHOLD);
+  const low = adminProducts.filter(i=>availableQty(i)<=LOW_STOCK_THRESHOLD);
   lowStockAdminCount = low.length;
   if (low.length > 0){ lowStockAdminPopupOpen = true; }
 }
@@ -305,7 +306,7 @@ async function checkForSentReports(){
   try{ const r = await api('sent-reports.php'); mySentReports = r.pending; if (mySentReports.length){ reportPopupOpen = true; } }catch(e){}
 }
 function checkForLowStock(){
-  if (myProducts.some(i=>i.qty<=POPUP_LOW_STOCK_THRESHOLD)){ lowStockPopupOpen = true; }
+  if (myProducts.some(i=>availableQty(i)<=POPUP_LOW_STOCK_THRESHOLD)){ lowStockPopupOpen = true; }
 }
 async function loadWalletData(){
   const r = await api('withdrawals.php');
@@ -540,13 +541,15 @@ function storeSidebarItems(){
   if (actor.is_primary) items.push({k:'team', label:'Team'});
   items.push({k:'wallet', label:'Wallet'});
   items.push({k:'report', label:'Report'});
-  return items.map(i => ({...i, ico: STORE_SIDEBAR_ICONS[i.k]}));
+  items.push({k:'account', label:'Account'});
+  return items.map(i => ({...i, ico: STORE_SIDEBAR_ICONS[i.k] || '⚙️'}));
 }
 function adminSidebarItems(){
   const perms = actor.permissions || {};
   const keys = ['orders','inventory','stores','team','withdrawals','expenses','customers','zones','trash'];
   const items = keys.filter(k=>perms[k]).map(k=>({k, label:ADMIN_SIDEBAR_LABELS[k], ico:ADMIN_SIDEBAR_ICONS[k]}));
   items.push({k:'report', label:'Report', ico:ADMIN_SIDEBAR_ICONS.report});
+  items.push({k:'account', label:'Account', ico:'⚙️'});
   return items;
 }
 function sidebarItems(){ return actor.type === 'store' ? storeSidebarItems() : adminSidebarItems(); }
@@ -587,6 +590,7 @@ function sectionContent(){
     if (activeSection==='team' && actor.is_primary) return storeTeamPanel(myProducts, myAgents);
     if (activeSection==='wallet') return storeWalletPanel();
     if (activeSection==='report') return reportPanel(false, null);
+    if (activeSection==='account') return accountPanel();
     return storeOrdersSection();
   }
   const perms = actor.permissions || {};
@@ -600,7 +604,17 @@ function sectionContent(){
   if (activeSection==='zones' && perms.zones) return zonesPanel();
   if (activeSection==='trash' && perms.trash) return trashPanel();
   if (activeSection==='report') return reportPanel(true, reportData.storeOptions || []);
+  if (activeSection==='account') return accountPanel();
   return '<div class="empty">Nothing to show here.</div>';
+}
+function accountPanel(){
+  const label = actor.type === 'admin'
+    ? `${escapeHtml(actor.name || 'Dispatch Admin')}${actor.position?' — '+escapeHtml(actor.position):''} (${escapeHtml(actor.admin_id)})`
+    : `${escapeHtml(actor.store_name)}${!actor.is_primary?' — '+escapeHtml(actor.position||'Team member'):''} (${escapeHtml(actor.store_id||'')})`;
+  return `<div class="panel"><h2><span class="dot"></span>Account</h2>
+    <p class="hint">Logged in as: <b>${label}</b></p>
+    <button class="btn" id="pw-change-open-btn">Change password</button>
+  </div>`;
 }
 
 function topbar(){
@@ -620,8 +634,7 @@ function topbar(){
   return `<div class="topbar">
     <div class="session-tag" style="display:flex;align-items:center;gap:10px;">${label}</div>
     <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
-      ${extra}<button class="pw-change-btn" id="pw-change-open-btn">Change password</button>
-      <button class="logout" id="logout-btn">Log out</button>
+      ${extra}<button class="logout" id="logout-btn">Log out</button>
     </div>
   </div>`;
 }
@@ -860,12 +873,13 @@ function statusPillRow(list, allForCounts, filterKey){
   const counts = {}; STATUSES.forEach(s=>counts[s.v]=0);
   allForCounts.forEach(o=>counts[o.status]=(counts[o.status]||0)+1);
   const allActive = filterStatus==='all';
-  // "Active" (was "All") excludes Remitted/Cancelled/Returned from the
-  // default view and its count — they're still fully reachable via their
-  // own pill below, just not cluttering the default list.
-  const activeCount = allForCounts.filter(o=>!ARCHIVED_STATUSES.includes(o.status)).length;
+  // "New" (was "Active") shows only orders still in Pending dispatch —
+  // i.e. orders dispatch hasn't touched yet. The moment an order moves to
+  // any other status it drops out of this default view; find it under
+  // that status's own pill instead.
+  const newCount = counts['pending'] || 0;
   return `<div class="pill-row">
-    <div class="pill" data-statfilter="all" data-statkey="${filterKey}" title="Active orders — Remitted, Cancelled and Returned have their own pills" style="${allActive?`background:var(--ink);color:#fff;border-color:var(--ink);`:`background:#fff;color:var(--ink);border-color:var(--ink);`}">Active <span class="cnt" style="${allActive?'color:#cfd8e0;':''}">(${activeCount})</span></div>
+    <div class="pill" data-statfilter="all" data-statkey="${filterKey}" title="New, unactioned orders only — once an order has been moved to any other status, find it under that status's own pill" style="${allActive?`background:var(--ink);color:#fff;border-color:var(--ink);`:`background:#fff;color:var(--ink);border-color:var(--ink);`}">New <span class="cnt" style="${allActive?'color:#cfd8e0;':''}">(${newCount})</span></div>
     ${STATUSES.map(s=>{ const active=filterStatus===s.v;
       return `<div class="pill" data-statfilter="${s.v}" data-statkey="${filterKey}" style="${active?`background:${s.solid};color:#fff;border-color:${s.solid};`:`background:${s.dim};color:${s.solid};border-color:${s.solid};`}">${s.label} <span class="cnt" style="${active?'color:rgba(255,255,255,.75);':`color:${s.solid};opacity:.7;`}">(${counts[s.v]})</span></div>`;
     }).join('')}
@@ -931,7 +945,8 @@ function storeOrderFormPanel(availableInv){
       <div class="row3">
         <div><label>Customer name</label><input id="f-customer" placeholder="e.g. Chidi Okafor" /></div>
         <div><label>Product</label><select id="f-product">
-          ${availableInv.map(i=>`<option value="${i.id}" ${i.qty<=0?'disabled':''}>${escapeHtml(i.name)} — ${i.qty} in stock${i.qty<=0?' (out of stock)':''}</option>`).join('')}
+          ${availableInv.map(i=>{ const avail = i.available!=null ? i.available : i.qty;
+            return `<option value="${i.id}">${escapeHtml(i.name)} — ${avail} available${avail<=0?' (backorder)':''}</option>`; }).join('')}
         </select></div>
         <div><label>Quantity</label><input id="f-qty" type="number" min="1" value="1" /></div>
       </div>
@@ -975,7 +990,7 @@ function storeOrdersListPanel(mine){
   let list = sorted;
   const filterStatus = window._historyStatFilter || 'all';
   if (filterStatus!=='all') list = list.filter(o=>o.status===filterStatus);
-  else list = list.filter(o=>!ARCHIVED_STATUSES.includes(o.status));
+  else list = list.filter(o=>o.status==='pending');
   if (searchTerm) list = list.filter(o=>o.customer.toLowerCase().includes(searchTerm) || o.phone.toLowerCase().includes(searchTerm) || o.id.toLowerCase().includes(searchTerm));
 
   return `<div class="panel">
@@ -1002,7 +1017,7 @@ function orderRowStub(o, allMine){
     <div class="stub-top">
       <label style="display:flex;align-items:flex-start;gap:10px;text-transform:none;font-weight:400;margin:0;">
         <input type="checkbox" class="order-select-cb" data-id="${escapeHtml(o.id)}" ${selectedOrderIds.has(o.id)?'checked':''} style="width:auto;margin-top:3px;" />
-        <div><div class="stub-id mono">#${escapeHtml(o.id)}</div><div class="stub-item">${escapeHtml(o.item)}${o.qty>1?' × '+o.qty:''}${o.zone?` <span class="badge badge-role">📍 ${escapeHtml(o.zone)}</span>`:''}${repeatCount>1?` <span class="badge badge-ok">↻ Repeat (${repeatCount})</span>`:''}</div></div>
+        <div><div class="stub-id mono">#${escapeHtml(o.id)}</div><div class="stub-item">${escapeHtml(o.item)}${o.qty>1?' × '+o.qty:''}${o.zone?` <span class="badge badge-role">📍 ${escapeHtml(o.zone)}</span>`:''}${repeatCount>1?` <span class="badge badge-ok">↻ Repeat (${repeatCount})</span>`:''}${o.isBackorder?` <span class="badge badge-notpicking">⏳ Backorder</span>`:''}</div></div>
       </label>
       <span class="badge ${sm.badge}">${sm.label}</span>
     </div>
@@ -1030,14 +1045,17 @@ function inventorySection(isStore){
  * always get a view-only row plus the "last updated by/at" accountability
  * trail, whether they're the one it's shown to or the admin confirming it. */
 function invRow(i, isAdmin){
-  const low = i.qty<=LOW_STOCK_THRESHOLD;
+  const available = i.available!=null ? i.available : i.qty;
+  const reserved = i.qty - available;
+  const low = available<=LOW_STOCK_THRESHOLD;
   return `<div class="inv-row">
     ${isAdmin ? `<input type="checkbox" class="inv-select-cb" data-id="${i.id}" ${selectedInvIds.has(i.id)?'checked':''} />` : '<div></div>'}
     <div><div class="inv-name">${escapeHtml(i.name)}${isAdmin && i.store_name ? ` <span class="mono" style="color:var(--slate);font-size:11px;">${escapeHtml(i.store_name)}</span>` : ''}</div>
       ${i.dropped_off_at ? `<div class="inv-date">Dropped off ${escapeHtml(i.dropped_off_at)}</div>` : ''}
+      ${reserved>0 ? `<div class="inv-date">${reserved} reserved by order(s) not yet delivered</div>` : ''}
       ${i.qty_updated_at && i.qty_updated_by ? `<div class="inv-date">Last updated ${new Date(i.qty_updated_at.replace(' ','T')).toLocaleString()} by ${escapeHtml(i.qty_updated_by)}</div>` : ''}</div>
-    <span class="badge ${low?'badge-low':'badge-ok'}">${low ? (i.qty<=0?'Out of stock':'Low stock') : 'In stock'}</span>
-    <div class="inv-qty">${i.qty}</div>
+    <span class="badge ${low?'badge-low':'badge-ok'}">${low ? (available<=0?'Out of stock':'Low stock') : 'In stock'}</span>
+    <div class="inv-qty">${i.qty}${reserved>0?`<div style="font-size:10px;font-weight:400;color:var(--slate);">${available} available</div>`:''}</div>
     <div class="inv-actions">${isAdmin ? `<button class="qty-btn" data-inv="${i.id}" data-delta="-1">−</button><button class="qty-btn" data-inv="${i.id}" data-delta="1">+</button>` : ''}</div></div>`;
 }
 function storeInventoryPanel(myInv){
@@ -1129,7 +1147,7 @@ function adminInventoryPanel(){
     const storeNames = [...new Set(adminProducts.map(i=>i.store_name))].sort();
     const rows = storeNames.map(store=>{
       const items = adminProducts.filter(i=>i.store_name===store);
-      const lowCount = items.filter(i=>i.qty<=LOW_STOCK_THRESHOLD).length;
+      const lowCount = items.filter(i=>availableQty(i)<=LOW_STOCK_THRESHOLD).length;
       return `<div class="day-row" data-drill-inv-store="${escapeHtml(store)}">
         <span class="dlabel">${escapeHtml(store)}</span>
         <span class="dcount">${items.length} product(s)${lowCount?` · ⚠ ${lowCount} low/out`:''}</span>
@@ -1314,10 +1332,10 @@ function sentReportPopup(pending){
     </div></div>`;
 }
 function lowStockPopup(){
-  const low = myProducts.filter(i=>i.qty<=POPUP_LOW_STOCK_THRESHOLD);
+  const low = myProducts.filter(i=>availableQty(i)<=POPUP_LOW_STOCK_THRESHOLD);
   return `<div class="modal-overlay" id="lowstock-overlay"><div class="modal">
     <h3>⚠ Time to restock</h3><div class="id">${low.length} product(s) are running low</div>
-    ${low.map(i=>`<div class="new-order-item">${escapeHtml(i.name)} — only ${i.qty} left</div>`).join('')}
+    ${low.map(i=>`<div class="new-order-item">${escapeHtml(i.name)} — only ${availableQty(i)} available</div>`).join('')}
     <div class="modal-actions"><button class="btn btn-outline" id="lowstock-close">Dismiss</button><button class="btn" id="lowstock-goto">Go to Inventory</button></div>
   </div></div>`;
 }
@@ -1330,13 +1348,13 @@ function withdrawalRequestPopup(pending){
   </div></div>`;
 }
 function lowStockAdminPopup(){
-  const low = adminProducts.filter(i=>i.qty<=LOW_STOCK_THRESHOLD);
+  const low = adminProducts.filter(i=>availableQty(i)<=LOW_STOCK_THRESHOLD);
   const byStore = {};
   low.forEach(i=>{ (byStore[i.store_name] = byStore[i.store_name] || []).push(i); });
   return `<div class="modal-overlay" id="lowstock-admin-overlay"><div class="modal">
     <h3>⚠ ${low.length} product${low.length>1?'s':''} low or out of stock</h3>
     <div class="id">Across ${Object.keys(byStore).length} store(s)</div>
-    ${Object.keys(byStore).map(store=>`<div class="new-order-item"><span class="store-tag">${escapeHtml(store)}</span>${byStore[store].map(i=>escapeHtml(i.name)+' ('+i.qty+')').join(', ')}</div>`).join('')}
+    ${Object.keys(byStore).map(store=>`<div class="new-order-item"><span class="store-tag">${escapeHtml(store)}</span>${byStore[store].map(i=>escapeHtml(i.name)+' ('+availableQty(i)+' available)').join(', ')}</div>`).join('')}
     <div class="modal-actions"><button class="btn btn-outline" id="lowstock-admin-close">Close</button><button class="btn" id="lowstock-admin-goto">Go to Inventory</button></div>
   </div></div>`;
 }
@@ -1477,7 +1495,7 @@ function currentFilteredAdminOrders(){
   const searchTerm = (window._searchTerm || '').toLowerCase();
   let list = adminOrders.slice().sort((a,b)=>b.createdAt-a.createdAt);
   if (filterStatus !== 'all') list = list.filter(o=>o.status===filterStatus);
-  else list = list.filter(o=>!ARCHIVED_STATUSES.includes(o.status));
+  else list = list.filter(o=>o.status==='pending');
   if (searchTerm) list = list.filter(o=>o.customer.toLowerCase().includes(searchTerm)||o.phone.toLowerCase().includes(searchTerm)||o.id.toLowerCase().includes(searchTerm));
   return list;
 }
@@ -1507,7 +1525,7 @@ function adminOrdersSection(){
   let list = adminOrders.slice().sort((a,b)=>b.createdAt-a.createdAt);
   const filterStatus = window._filterStatus || 'all';
   if (filterStatus!=='all') list = list.filter(o=>o.status===filterStatus);
-  else list = list.filter(o=>!ARCHIVED_STATUSES.includes(o.status));
+  else list = list.filter(o=>o.status==='pending');
   if (searchTerm) list = list.filter(o=>
     o.customer.toLowerCase().includes(searchTerm) || o.phone.toLowerCase().includes(searchTerm) || o.id.toLowerCase().includes(searchTerm)
   );
@@ -1534,16 +1552,17 @@ function adminOrdersSection(){
 function adminRow(o, allForRepeat){
   const sm = statusMeta(o.status);
   const total = (o.deliveryFee||0)+(o.otherCharges||0);
-  const canRestock = (o.status==='cancelled' || o.status==='issue' || o.status==='returned') && !o.restocked;
   const repeatCount = allForRepeat ? customerOrderCount(o.phone, allForRepeat) : 0;
-  return `<div class="admin-row" style="grid-template-columns:auto auto 1.3fr auto auto auto auto;">
-    <input type="checkbox" class="order-select-cb" data-id="${escapeHtml(o.id)}" ${selectedOrderIds.has(o.id)?'checked':''} style="width:auto;margin:0;transform:scale(1.2);" />
-    <div class="admin-store">${escapeHtml(o.store)}</div>
-    <div class="admin-main"><div class="item">${escapeHtml(o.item)}${o.qty>1?' × '+o.qty:''} <span class="mono" style="color:var(--slate);font-size:11px;">#${escapeHtml(o.id)}</span>${o.zone?` <span class="badge badge-role">📍 ${escapeHtml(o.zone)}</span>`:''}${repeatCount>1?` <span class="badge badge-ok">↻ Repeat (${repeatCount})</span>`:''}</div>
+  return `<div class="admin-row" style="grid-template-columns:auto 1.3fr auto auto auto auto;">
+    <div class="order-row-check-group">
+      <input type="checkbox" class="order-select-cb" data-id="${escapeHtml(o.id)}" ${selectedOrderIds.has(o.id)?'checked':''} />
+      <div class="admin-store">${escapeHtml(o.store)}</div>
+    </div>
+    <div class="admin-main"><div class="item">${escapeHtml(o.item)}${o.qty>1?' × '+o.qty:''} <span class="mono" style="color:var(--slate);font-size:11px;">#${escapeHtml(o.id)}</span>${o.zone?` <span class="badge badge-role">📍 ${escapeHtml(o.zone)}</span>`:''}${repeatCount>1?` <span class="badge badge-ok">↻ Repeat (${repeatCount})</span>`:''}${o.isBackorder?` <span class="badge badge-notpicking">⏳ Backorder</span>`:''}</div>
     <div class="sub">${escapeHtml(o.customer)} · ${escapeHtml(o.phone)}${o.altPhone?' / '+escapeHtml(o.altPhone):''} — to ${escapeHtml(o.dropoff)}${o.lastUpdatedBy?' · by '+escapeHtml(o.lastUpdatedBy):''}</div></div>
     <span class="badge ${sm.badge}">${sm.label}</span>
     <div class="admin-charges">${total ? `<b>${money(total)}</b>` : '—'}</div>
-    <div>${canRestock ? `<button class="restock-btn" data-restock="${escapeHtml(o.id)}">Restock</button>` : (o.restocked ? '<span style="font-size:10px;color:var(--slate);">restocked</span>' : '')}</div>
+    <div class="stock-note">${o.stockDeducted ? 'stock deducted' : 'stock reserved'}</div>
     <div style="display:flex;gap:6px;flex-wrap:wrap;">
       <button class="admin-update-btn" data-id="${escapeHtml(o.id)}">Update</button>
       ${o.prevStatus?`<button class="undo-btn" data-undo="${escapeHtml(o.id)}" title="Reverse back to ${statusMeta(o.prevStatus).label}">Undo</button>`:''}
@@ -1594,11 +1613,16 @@ function attachOrdersHandlers(){
         const qty = parseInt(document.getElementById('f-qty').value, 10) || 1;
         if (!productId || !customer || !phone || !dropoff){ showToast('Fill in name, product, address and phone number'); return; }
         if (qty < 1){ showToast('Quantity must be at least 1'); return; }
+        const product = myProducts.find(i=>i.id===productId);
+        const available = product && product.available!=null ? product.available : (product ? product.qty : 0);
+        if (product && qty > available){
+          if (!confirm(`Only ${available} of "${product.name}" available right now. This order will be placed as a backorder, to fulfill once restocked. Continue?`)) return;
+        }
         busy = true; render();
         try{
-          await api('orders.php', {method:'POST', body:{product_id:productId, customer, phone, altPhone, dropoff, zone, notes, amount, qty}});
+          const r = await api('orders.php', {method:'POST', body:{product_id:productId, customer, phone, altPhone, dropoff, zone, notes, amount, qty}});
           await loadStoreData();
-          showToast('Order submitted — stock updated');
+          showToast(r.is_backorder ? 'Order submitted as a backorder' : 'Order submitted');
         }catch(e){ showToast(e.message); }
         busy = false; render();
       };
@@ -1660,22 +1684,12 @@ function attachOrdersHandlers(){
     document.querySelectorAll('.admin-update-btn[data-id]').forEach(btn=>{
       btn.onclick = () => { modalOrder = adminOrders.find(o=>o.id===btn.dataset.id); render(); };
     });
-    document.querySelectorAll('.restock-btn[data-restock]').forEach(btn=>{
-      btn.onclick = async () => {
-        try{
-          await api('orders.php', {method:'PATCH', body:{id: btn.dataset.restock, action:'restock'}});
-          await reloadAdminOrdersWithDate();
-          await loadAdminData();
-          showToast('Stock restored to inventory');
-          render();
-        }catch(e){ showToast(e.message); }
-      };
-    });
     document.querySelectorAll('.undo-btn[data-undo]').forEach(btn=>{
       btn.onclick = async () => {
         try{
           await api('orders.php', {method:'PATCH', body:{action:'undo', id:btn.dataset.undo}});
           await reloadAdminOrdersWithDate();
+          await loadAdminData();
           showToast('Order reversed');
           render();
         }catch(e){ showToast(e.message); }
@@ -1720,6 +1734,7 @@ function attachOrdersHandlers(){
           const status = action.split(':')[1];
           const r = await api('orders.php', {method:'PATCH', body:{action:'bulk_status', ids, status}});
           showToast(r.skipped ? `${r.updated} order(s) updated, ${r.skipped} skipped (Delivered can only move to Delivered/Remitted)` : `${r.updated} order(s) updated`);
+          await loadAdminData(); // status changes can move physical stock (Delivered deducts, reversing credits back)
         }
         selectedOrderIds = new Set();
         if (actor.type==='store') await reloadStoreOrdersWithDate(); else await reloadAdminOrdersWithDate();
@@ -2111,12 +2126,6 @@ function attachZonesHandlers(){
       catch(e){ showToast(e.message); }
     };
   });
-  document.querySelectorAll('.restock-btn[data-restock]').forEach(btn=>{
-    btn.onclick = async () => {
-      try{ await api('orders.php', {method:'PATCH', body:{id: btn.dataset.restock, action:'restock'}}); await loadAdminData(); showToast('Stock restored to inventory'); render(); }
-      catch(e){ showToast(e.message); }
-    };
-  });
 }
 
 /* ---------------- ADMIN: DELETED ORDERS (TRASH) ---------------- */
@@ -2187,6 +2196,7 @@ function attachPopupHandlers(){
         await api('orders.php', {method:'PATCH', body:{id: modalOrder.id, status, rider, remark, deliveryFee, otherCharges, chargeNote}});
         modalOrder = null;
         await reloadAdminOrdersWithDate();
+        await loadAdminData(); // status change can move physical stock (Delivered deducts, reversing credits back)
         showToast('Order updated');
       }catch(e){ showToast(e.message); }
       busy = false; render();

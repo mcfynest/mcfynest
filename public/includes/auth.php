@@ -261,12 +261,22 @@ function login_admin(PDO $pdo, string $adminId, string $password): array
     return $row;
 }
 
+/**
+ * Clears the actor's session data and rotates to a brand-new session ID,
+ * rather than destroying the session and expiring its cookie. The old
+ * approach (setcookie(..., expired) + session_destroy(), then a fresh
+ * session_start() in logout.php to hand back a usable CSRF token for an
+ * immediate re-login) raced against itself: PHP doesn't reliably re-send
+ * a Set-Cookie header for a session_start() that resumes an ID already
+ * present in the request, so the expired cookie from setcookie() could
+ * end up being the last one the browser actually applied — leaving no
+ * valid session cookie until a manual page reload, which surfaced as
+ * "session expired" on an immediate re-login attempt right after
+ * logging out. Regenerating in place always issues a fresh, valid
+ * Set-Cookie for the new ID in the same response, with no such race.
+ */
 function logout_actor(): void
 {
     $_SESSION = [];
-    if (ini_get('session.use_cookies')) {
-        $params = session_get_cookie_params();
-        setcookie(session_name(), '', time() - 42000, $params['path'], $params['domain'], $params['secure'], $params['httponly']);
-    }
-    session_destroy();
+    session_regenerate_id(true);
 }

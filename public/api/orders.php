@@ -7,11 +7,43 @@ $actor = require_actor();
 $method = $_SERVER['REQUEST_METHOD'];
 
 const ORDER_STATUSES = ['pending', 'scheduled', 'shipped', 'transit', 'delivered', 'remitted', 'notpicking', 'issue', 'returned', 'cancelled'];
-const RESTOCK_ELIGIBLE_STATUSES = ['cancelled', 'issue', 'returned'];
 // Once an order is Delivered, a direct status change may only move it
 // forward to Remitted — reversing it back to an earlier status goes
 // through the dedicated 'undo' action instead, never a regular update.
 const POST_DELIVERED_ALLOWED_STATUSES = ['delivered', 'remitted'];
+// Statuses that still count against a product's reserved quantity —
+// i.e. the order hasn't reached a resolved end state yet. Delivered/
+// Remitted have already deducted physical stock (see stock_deducted
+// below) so they stop reserving; Cancelled/Returned never held stock
+// in the first place under this model, so they never reserved either.
+const RESERVING_STATUSES = ['pending', 'scheduled', 'shipped', 'transit', 'notpicking', 'issue'];
+
+/**
+ * Physical stock is deducted exactly once, the moment an order first
+ * reaches Delivered/Remitted — never at order placement. Reversing out
+ * of Delivered/Remitted (Undo, or a manual status change back) adds it
+ * back. The stock_deducted flag is the single source of truth for
+ * whether a deduction actually happened, so this is always idempotent
+ * regardless of how many times a status flips back and forth.
+ */
+function apply_stock_for_status_change(PDO $pdo, array $order, string $oldStatus, string $newStatus): void
+{
+    if (!$order['product_id']) {
+        return;
+    }
+    $wasDelivered = in_array($oldStatus, POST_DELIVERED_ALLOWED_STATUSES, true);
+    $isDelivered = in_array($newStatus, POST_DELIVERED_ALLOWED_STATUSES, true);
+
+    if (!$wasDelivered && $isDelivered && !$order['stock_deducted']) {
+        $pdo->prepare('UPDATE products SET qty = GREATEST(0, qty - ?) WHERE id = ?')
+            ->execute([$order['qty'], $order['product_id']]);
+        $pdo->prepare('UPDATE orders SET stock_deducted = 1 WHERE id = ?')->execute([$order['id']]);
+    } elseif ($wasDelivered && !$isDelivered && $order['stock_deducted']) {
+        $pdo->prepare('UPDATE products SET qty = qty + ? WHERE id = ?')
+            ->execute([$order['qty'], $order['product_id']]);
+        $pdo->prepare('UPDATE orders SET stock_deducted = 0 WHERE id = ?')->execute([$order['id']]);
+    }
+}
 
 function order_row_for_client(array $o): array
 {
@@ -37,7 +69,8 @@ function order_row_for_client(array $o): array
         'otherCharges' => (float) $o['other_charges'],
         'chargeNote' => $o['charge_note'],
         'seen' => (bool) $o['seen_by_admin'],
-        'restocked' => (bool) $o['restocked'],
+        'isBackorder' => (bool) $o['is_backorder'],
+        'stockDeducted' => (bool) $o['stock_deducted'],
         'lastUpdatedBy' => $o['last_updated_by_name'],
         'createdAt' => strtotime($o['created_at']) * 1000,
         'updatedAt' => strtotime($o['updated_at']) * 1000,
@@ -133,6 +166,11 @@ if ($method === 'POST') {
 
     $pdo->beginTransaction();
     try {
+        // Placing an order never touches physical stock — it only counts
+        // against the product's reserved quantity (see RESERVING_STATUSES).
+        // The row lock here is still what makes "available" a consistent
+        // read under concurrent order placement, same guarantee the old
+        // qty-decrement had; we just no longer mutate qty at this point.
         $stmt = $pdo->prepare('SELECT id, name, qty FROM products WHERE id = ? AND store_id = ? AND deleted = 0 FOR UPDATE');
         $stmt->execute([$productId, $actor['owner_row_id']]);
         $product = $stmt->fetch();
@@ -141,20 +179,25 @@ if ($method === 'POST') {
             $pdo->rollBack();
             json_error('Product not found.', 404);
         }
-        if ((int) $product['qty'] < $qty) {
-            $pdo->rollBack();
-            json_error('Only ' . $product['qty'] . ' in stock.', 409);
-        }
 
-        $pdo->prepare('UPDATE products SET qty = qty - ? WHERE id = ?')->execute([$qty, $productId]);
+        $placeholders = implode(',', array_fill(0, count(RESERVING_STATUSES), '?'));
+        $stmt = $pdo->prepare("SELECT COALESCE(SUM(qty), 0) FROM orders WHERE product_id = ? AND deleted = 0 AND status IN ($placeholders)");
+        $stmt->execute(array_merge([$productId], RESERVING_STATUSES));
+        $reserved = (int) $stmt->fetchColumn();
+        $available = max(0, (int) $product['qty'] - $reserved);
+
+        // Backorders are explicitly allowed — never blocked server-side.
+        // is_backorder is computed here (not trusted from the client) so
+        // the badge is always accurate regardless of what the client sent.
+        $isBackorder = $qty > $available;
 
         $orderCode = generate_order_code($pdo);
         $stmt = $pdo->prepare('INSERT INTO orders
-            (order_code, store_id, placed_by_store_id, product_id, product_name, qty, customer_name, phone, alt_phone, delivery_address, zone, instructions, amount)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+            (order_code, store_id, placed_by_store_id, product_id, product_name, qty, customer_name, phone, alt_phone, delivery_address, zone, instructions, amount, is_backorder)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
         $stmt->execute([
             $orderCode, $actor['owner_row_id'], $actor['row_id'], $productId, $product['name'], $qty,
-            $customer, $phone, $altPhone ?: null, $dropoff, $zone ?: null, $notes, $amount,
+            $customer, $phone, $altPhone ?: null, $dropoff, $zone ?: null, $notes, $amount, $isBackorder ? 1 : 0,
         ]);
 
         $pdo->commit();
@@ -165,7 +208,7 @@ if ($method === 'POST') {
         throw $e;
     }
 
-    json_response(['order_code' => $orderCode], 201);
+    json_response(['order_code' => $orderCode, 'is_backorder' => $isBackorder], 201);
 }
 
 if ($method === 'PATCH') {
@@ -239,11 +282,11 @@ if ($method === 'PATCH') {
         $pdo->beginTransaction();
         try {
             $placeholders = implode(',', array_fill(0, count($ids), '?'));
-            $stmt = $pdo->prepare("SELECT order_code, status FROM orders WHERE order_code IN ($placeholders) AND deleted = 0 FOR UPDATE");
+            $stmt = $pdo->prepare("SELECT id, order_code, status, product_id, qty, stock_deducted FROM orders WHERE order_code IN ($placeholders) AND deleted = 0 FOR UPDATE");
             $stmt->execute($ids);
             $rows = $stmt->fetchAll();
 
-            $upd = $pdo->prepare('UPDATE orders SET status = ?, prev_status = ?, last_updated_by_name = ?, updated_at = CURRENT_TIMESTAMP WHERE order_code = ?');
+            $upd = $pdo->prepare('UPDATE orders SET status = ?, prev_status = ?, last_updated_by_name = ?, seen_by_admin = 1, updated_at = CURRENT_TIMESTAMP WHERE order_code = ?');
             foreach ($rows as $row) {
                 $current = $row['status'];
                 if ($current === $status) {
@@ -254,6 +297,7 @@ if ($method === 'PATCH') {
                     continue;
                 }
                 $upd->execute([$status, $current, $adminName, $row['order_code']]);
+                apply_stock_for_status_change($pdo, $row, $current, $status);
                 $updated++;
             }
             $pdo->commit();
@@ -312,7 +356,7 @@ if ($method === 'PATCH') {
 
         $pdo->beginTransaction();
         try {
-            $stmt = $pdo->prepare('SELECT id, prev_status FROM orders WHERE order_code = ? AND deleted = 0 FOR UPDATE');
+            $stmt = $pdo->prepare('SELECT id, status, prev_status, product_id, qty, stock_deducted FROM orders WHERE order_code = ? AND deleted = 0 FOR UPDATE');
             $stmt->execute([$orderCode]);
             $order = $stmt->fetch();
             if (!$order) {
@@ -323,8 +367,10 @@ if ($method === 'PATCH') {
                 $pdo->rollBack();
                 json_error('Nothing to undo for this order.', 400);
             }
-            $pdo->prepare('UPDATE orders SET status = ?, prev_status = NULL, last_updated_by_name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+            $oldStatus = $order['status'];
+            $pdo->prepare('UPDATE orders SET status = ?, prev_status = NULL, last_updated_by_name = ?, seen_by_admin = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
                 ->execute([$order['prev_status'], $adminName, $order['id']]);
+            apply_stock_for_status_change($pdo, $order, $oldStatus, $order['prev_status']);
             $pdo->commit();
         } catch (Throwable $e) {
             if ($pdo->inTransaction()) {
@@ -333,48 +379,6 @@ if ($method === 'PATCH') {
             throw $e;
         }
         json_response(['ok' => true, 'status' => $order['prev_status']]);
-    }
-
-    // Restock: a manual, one-time action on a cancelled/issue/returned
-    // order — never automatic.
-    if ($action === 'restock') {
-        require_admin();
-        require_admin_permission($pdo, $actor, 'orders');
-        $orderCode = str_field($body, 'id');
-
-        $stmt = $pdo->prepare('SELECT name FROM admin_accounts WHERE id = ?');
-        $stmt->execute([$actor['row_id']]);
-        $adminName = (string) $stmt->fetchColumn();
-
-        $pdo->beginTransaction();
-        try {
-            $stmt = $pdo->prepare('SELECT id, product_id, qty, status, restocked FROM orders WHERE order_code = ? FOR UPDATE');
-            $stmt->execute([$orderCode]);
-            $order = $stmt->fetch();
-            if (!$order) {
-                $pdo->rollBack();
-                json_error('Order not found.', 404);
-            }
-            if ($order['restocked']) {
-                $pdo->rollBack();
-                json_error('This order has already been restocked.', 409);
-            }
-            if (!in_array($order['status'], RESTOCK_ELIGIBLE_STATUSES, true)) {
-                $pdo->rollBack();
-                json_error('Only cancelled, issue, or returned orders can be restocked.', 400);
-            }
-            if ($order['product_id']) {
-                $pdo->prepare('UPDATE products SET qty = qty + ? WHERE id = ?')->execute([$order['qty'], $order['product_id']]);
-            }
-            $pdo->prepare('UPDATE orders SET restocked = 1, last_updated_by_name = ? WHERE id = ?')->execute([$adminName, $order['id']]);
-            $pdo->commit();
-        } catch (Throwable $e) {
-            if ($pdo->inTransaction()) {
-                $pdo->rollBack();
-            }
-            throw $e;
-        }
-        json_response(['ok' => true]);
     }
 
     // Single order update (admin dispatch update)
@@ -401,7 +405,7 @@ if ($method === 'PATCH') {
 
     $pdo->beginTransaction();
     try {
-        $stmt = $pdo->prepare('SELECT id, status FROM orders WHERE order_code = ? FOR UPDATE');
+        $stmt = $pdo->prepare('SELECT id, status, product_id, qty, stock_deducted FROM orders WHERE order_code = ? FOR UPDATE');
         $stmt->execute([$orderCode]);
         $existing = $stmt->fetch();
         if (!$existing) {
@@ -415,11 +419,15 @@ if ($method === 'PATCH') {
             json_error('A Delivered order can only move to Delivered or Remitted here — use Undo on the order to reverse it instead.', 400);
         }
 
+        // Every save from the Update modal marks the order seen, whether
+        // or not the status itself actually changed — a dispatcher who
+        // opened and saved an order has "actioned" it either way.
         if ($status !== $currentStatus) {
-            $stmt = $pdo->prepare('UPDATE orders SET status=?, prev_status=?, rider=?, dispatch_note=?, delivery_fee=?, other_charges=?, charge_note=?, last_updated_by_name=? WHERE order_code=?');
+            $stmt = $pdo->prepare('UPDATE orders SET status=?, prev_status=?, rider=?, dispatch_note=?, delivery_fee=?, other_charges=?, charge_note=?, last_updated_by_name=?, seen_by_admin=1 WHERE order_code=?');
             $stmt->execute([$status, $currentStatus, $rider, $remark, $deliveryFee, $otherCharges, $chargeNote, $adminName, $orderCode]);
+            apply_stock_for_status_change($pdo, $existing, $currentStatus, $status);
         } else {
-            $stmt = $pdo->prepare('UPDATE orders SET status=?, rider=?, dispatch_note=?, delivery_fee=?, other_charges=?, charge_note=?, last_updated_by_name=? WHERE order_code=?');
+            $stmt = $pdo->prepare('UPDATE orders SET status=?, rider=?, dispatch_note=?, delivery_fee=?, other_charges=?, charge_note=?, last_updated_by_name=?, seen_by_admin=1 WHERE order_code=?');
             $stmt->execute([$status, $rider, $remark, $deliveryFee, $otherCharges, $chargeNote, $adminName, $orderCode]);
         }
         $pdo->commit();

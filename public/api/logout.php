@@ -7,5 +7,4 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
 }
 
 logout_actor();
-session_start();
 json_response(['csrf_token' => csrf_token(), 'actor' => null]);

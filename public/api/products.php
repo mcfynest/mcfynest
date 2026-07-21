@@ -6,24 +6,48 @@ $pdo = db();
 $actor = require_actor();
 $method = $_SERVER['REQUEST_METHOD'];
 
+// Same reserving-status list as orders.php (kept in sync manually since
+// the two endpoints don't share a common include for this): an order
+// still counts against a product's reserved quantity until it reaches a
+// resolved end state (Delivered/Remitted have already deducted physical
+// stock; Cancelled/Returned never held any under this model).
+const RESERVING_STATUSES = ['pending', 'scheduled', 'shipped', 'transit', 'notpicking', 'issue'];
+
+function attach_available_qty(array $products): array
+{
+    return array_map(function ($p) {
+        $p['qty'] = (int) $p['qty'];
+        $p['reserved'] = (int) $p['reserved'];
+        $p['available'] = max(0, $p['qty'] - $p['reserved']);
+        return $p;
+    }, $products);
+}
+
 if ($method === 'GET') {
+    $reservingPlaceholders = implode(',', array_fill(0, count(RESERVING_STATUSES), '?'));
+
     if ($actor['type'] === 'admin') {
         require_admin_permission($pdo, $actor, 'inventory');
 
         // Lightweight count-only mode for the quiet-poll bell badge —
-        // never returns row data, just how many products are at/under
-        // the low-stock threshold right now.
+        // never returns row data, just how many products are at/under the
+        // low-stock threshold right now, based on *available* quantity
+        // (physical minus reserved), since that's what actually
+        // determines whether a new order can be fulfilled without
+        // becoming a backorder.
         if (str_field($_GET, 'lowstock_count') === '1') {
             $threshold = defined('LOW_STOCK_THRESHOLD') ? LOW_STOCK_THRESHOLD : 1;
-            $stmt = $pdo->prepare('SELECT COUNT(*) FROM products WHERE deleted = 0 AND qty <= ?');
-            $stmt->execute([$threshold]);
+            $stmt = $pdo->prepare("SELECT COUNT(*) FROM products p WHERE p.deleted = 0
+                AND GREATEST(0, p.qty - (SELECT COALESCE(SUM(o.qty), 0) FROM orders o WHERE o.product_id = p.id AND o.deleted = 0 AND o.status IN ($reservingPlaceholders))) <= ?");
+            $stmt->execute(array_merge(RESERVING_STATUSES, [$threshold]));
             json_response(['count' => (int) $stmt->fetchColumn()]);
         }
 
         $storeFilter = str_field($_GET, 'store_id');
-        $sql = 'SELECT p.id, p.name, p.qty, p.dropped_off_at, p.created_at, p.qty_updated_at, p.qty_updated_by, s.store_name, s.store_id
-                FROM products p JOIN stores s ON s.id = p.store_id WHERE p.deleted = 0';
-        $params = [];
+        $sql = "SELECT p.id, p.name, p.qty, p.dropped_off_at, p.created_at, p.qty_updated_at, p.qty_updated_by, s.store_name, s.store_id,
+                (SELECT COALESCE(SUM(o.qty), 0) FROM orders o WHERE o.product_id = p.id AND o.deleted = 0 AND o.status IN ($reservingPlaceholders)) AS reserved
+                FROM products p JOIN stores s ON s.id = p.store_id WHERE p.deleted = 0";
+        $params = RESERVING_STATUSES;
         if ($storeFilter !== '' && $storeFilter !== 'all') {
             $sql .= ' AND s.store_id = ?';
             $params[] = $storeFilter;
@@ -31,7 +55,7 @@ if ($method === 'GET') {
         $sql .= ' ORDER BY s.store_name, p.name';
         $stmt = $pdo->prepare($sql);
         $stmt->execute($params);
-        json_response(['products' => $stmt->fetchAll()]);
+        json_response(['products' => attach_available_qty($stmt->fetchAll())]);
     }
 
     // Store actor (owner or team member) — a team member sees every
@@ -39,9 +63,12 @@ if ($method === 'GET') {
     // responsible for" tags are reference-only and don't filter this list.
     // qty_updated_at/qty_updated_by are included so a store can see who
     // (which admin) last confirmed their stock count and when.
-    $stmt = $pdo->prepare('SELECT id, name, qty, dropped_off_at, created_at, qty_updated_at, qty_updated_by FROM products WHERE store_id = ? AND deleted = 0 ORDER BY name');
-    $stmt->execute([$actor['owner_row_id']]);
-    json_response(['products' => $stmt->fetchAll()]);
+    $sql = "SELECT p.id, p.name, p.qty, p.dropped_off_at, p.created_at, p.qty_updated_at, p.qty_updated_by,
+            (SELECT COALESCE(SUM(o.qty), 0) FROM orders o WHERE o.product_id = p.id AND o.deleted = 0 AND o.status IN ($reservingPlaceholders)) AS reserved
+            FROM products p WHERE p.store_id = ? AND p.deleted = 0 ORDER BY p.name";
+    $stmt = $pdo->prepare($sql);
+    $stmt->execute(array_merge(RESERVING_STATUSES, [$actor['owner_row_id']]));
+    json_response(['products' => attach_available_qty($stmt->fetchAll())]);
 }
 
 if ($method === 'POST') {
