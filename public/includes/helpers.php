@@ -77,6 +77,24 @@ function generate_order_code(PDO $pdo): string
     return 'WB' . strtoupper(bin2hex(random_bytes(5)));
 }
 
+/**
+ * Appends one {status, at, by} entry to an order's status_history JSON
+ * column and persists it. Shared between orders.php (single update, bulk
+ * status change, undo) and report.php (marking Delivered orders
+ * Remitted) — every path that changes an order's status appends here, so
+ * the printed slip's status timeline (round 4 item #1) is always
+ * complete regardless of which action moved the order along.
+ */
+function append_status_history(PDO $pdo, int $orderId, ?string $existingHistoryJson, string $status, string $by): void
+{
+    $history = $existingHistoryJson ? json_decode($existingHistoryJson, true) : null;
+    if (!is_array($history)) {
+        $history = [];
+    }
+    $history[] = ['status' => $status, 'at' => date('Y-m-d H:i:s'), 'by' => $by];
+    $pdo->prepare('UPDATE orders SET status_history = ? WHERE id = ?')->execute([json_encode($history), $orderId]);
+}
+
 function money(?float $n): string
 {
     $n = $n ?? 0;

@@ -101,6 +101,10 @@ let onceCred = null;        // {label, storeId, password} shown right after crea
 let expandedStores = new Set();
 let selectedOrderIds = new Set();
 let selectedInvIds = new Set();
+let selectedReportIds = new Set();
+let reportPreviewOpen = false;
+let reportPreviewIds = [];     // order codes the preview modal is currently showing
+let reportPreviewStoreId = ''; // the store login ID the preview will send to (needed for the POST, distinct from the display name)
 let busy = false;
 let pollTimer = null;
 let idleTimer = null;
@@ -413,11 +417,47 @@ function attachPasswordToggles(){
 function rememberedCreds(){
   try{ const raw = localStorage.getItem(REMEMBERED_KEY); return raw ? JSON.parse(raw) : null; }catch(e){ return null; }
 }
+function bgIcons(){
+  const van = `<svg viewBox="0 0 140 80" xmlns="http://www.w3.org/2000/svg"><defs>
+      <linearGradient id="vanBody" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#F0813A"/><stop offset="100%" stop-color="#C9500A"/></linearGradient>
+      <linearGradient id="vanCab" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#F6DCC4"/><stop offset="100%" stop-color="#E8630C"/></linearGradient></defs>
+    <rect x="5" y="20" width="80" height="35" rx="5" fill="url(#vanBody)"/>
+    <path d="M85 20 h25 a8 8 0 0 1 8 8 v19 a8 8 0 0 1 -8 8 h-25 z" fill="url(#vanCab)"/>
+    <rect x="93" y="26" width="16" height="14" rx="2" fill="#CFE3F7"/>
+    <rect x="10" y="27" width="34" height="5" rx="2" fill="#fff" opacity="0.45"/>
+    <circle cx="30" cy="58" r="11" fill="#1B2430"/><circle cx="30" cy="58" r="4.5" fill="#9FB4C9"/>
+    <circle cx="95" cy="58" r="11" fill="#1B2430"/><circle cx="95" cy="58" r="4.5" fill="#9FB4C9"/></svg>`;
+  const bike = `<svg viewBox="0 0 160 90" xmlns="http://www.w3.org/2000/svg"><defs>
+      <linearGradient id="boxLidGrad" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#F0813A"/><stop offset="100%" stop-color="#C9500A"/></linearGradient></defs>
+    <circle cx="28" cy="68" r="14" fill="none" stroke="#1B2430" stroke-width="5"/><circle cx="28" cy="68" r="5" fill="#9FB4C9"/>
+    <circle cx="95" cy="68" r="14" fill="none" stroke="#1B2430" stroke-width="5"/><circle cx="95" cy="68" r="5" fill="#9FB4C9"/>
+    <path d="M28 68 L54 40 L80 40 L95 68" fill="none" stroke="#1D5B96" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M54 40 L59 22 L74 22" fill="none" stroke="#1D5B96" stroke-width="5" stroke-linecap="round"/>
+    <rect x="43" y="33" width="26" height="8" rx="3" fill="#1B2430"/>
+    <path d="M92 58 L112 58" stroke="#1B2430" stroke-width="4" stroke-linecap="round"/>
+    <rect x="88" y="14" width="42" height="46" rx="3" fill="url(#boxLidGrad)"/>
+    <rect x="88" y="14" width="42" height="11" rx="3" fill="#C9500A"/>
+    <rect x="95" y="30" width="28" height="5" rx="2" fill="#fff" opacity="0.5"/>
+    <rect x="95" y="40" width="28" height="5" rx="2" fill="#fff" opacity="0.3"/></svg>`;
+  const box = `<svg viewBox="0 0 70 70" xmlns="http://www.w3.org/2000/svg"><defs>
+      <linearGradient id="boxGrad" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#EFD9B8"/><stop offset="100%" stop-color="#C99B5E"/></linearGradient></defs>
+    <rect x="8" y="15" width="54" height="47" rx="3" fill="url(#boxGrad)"/>
+    <rect x="8" y="15" width="54" height="12" fill="#B5824A"/>
+    <rect x="30" y="15" width="10" height="47" fill="#8C6236"/>
+    <path d="M35 20 l-9 -13 h18 z" fill="#2F6B4F"/></svg>`;
+  const hub = `<svg viewBox="0 0 100 80" xmlns="http://www.w3.org/2000/svg">
+    <path d="M5 35 L50 8 L95 35 V72 H5 Z" fill="#1D5B96"/>
+    <rect x="20" y="45" width="20" height="27" fill="#E7F1FB"/><rect x="60" y="45" width="20" height="27" fill="#E7F1FB"/>
+    <rect x="42" y="52" width="16" height="20" fill="#1B2430"/></svg>`;
+  return `<div class="bg-icon i1">${van}</div><div class="bg-icon i2">${bike}</div><div class="bg-icon i3">${box}</div>
+    <div class="bg-icon i4">${hub}</div><div class="bg-icon i5">${box}</div><div class="bg-icon i6">${bike}</div>`;
+}
 function loginScreen(){
   if (forgotType) return forgotScreen();
   const remembered = rememberedCreds();
   return `
     <div class="role-screen">
+      ${bgIcons()}
       <div class="display role-title">MCFYNEST LOGISTICS</div>
       <div class="role-tag">Keeping every delivery on track, together.</div>
       <div class="login-panel">
@@ -469,6 +509,7 @@ function forgotScreen(){
   if (forgotSentContact){
     return `
       <div class="role-screen">
+        ${bgIcons()}
         <div class="display role-title" style="font-size:26px;">REQUEST SENT</div>
         <div class="role-tag">Your dispatch admin has been notified and will verify your identity, then reset your login and contact you at ${escapeHtml(forgotSentContact)}.</div>
         <button class="btn" id="forgot-done-btn">Back to login</button>
@@ -476,6 +517,7 @@ function forgotScreen(){
   }
   return `
     <div class="role-screen">
+      ${bgIcons()}
       <div class="display role-title" style="font-size:28px;">FORGOT LOGIN?</div>
       <div class="role-tag">Tell us who you are and how to reach you — this sends a request to your dispatch admin, who'll verify it's really you and reset your login.</div>
       <div class="panel" style="max-width:380px;width:100%;">
@@ -579,6 +621,7 @@ function appShell(){
       ${pwChangeOpen ? passwordChangeModal() : ''}
       ${onceCred ? onceCredBox() : ''}
       ${resetPwTarget ? resetPasswordModal() : ''}
+      ${reportPreviewOpen && actor.type==='admin' ? reportPreviewModal() : ''}
     </div>
   </div>`;
 }
@@ -1389,6 +1432,7 @@ function reportPanel(isAdmin, storeNames){
   const searchTerm = (window._reportSearch||'').toLowerCase();
   const visibleRows = searchTerm ? detailRows.filter(o=>o.customer.toLowerCase().includes(searchTerm)||(o.phone||'').toLowerCase().includes(searchTerm)) : detailRows;
   const detailTotals = showDayList ? totals : visibleRows.reduce((acc,o)=>({amount:acc.amount+o.amount, charge:acc.charge+o.charge, balance:acc.balance+o.balance}), {amount:0,charge:0,balance:0});
+  const deliveredInView = visibleRows.filter(o=>o.status==='delivered');
 
   return `<div class="panel">
     <h2><span class="dot"></span>Report ${reportData.store?'— '+escapeHtml(reportData.store):''}</h2>
@@ -1410,19 +1454,35 @@ function reportPanel(isAdmin, storeNames){
     </div>
     ${!showDayList && reportDrillDay ? `<div style="margin-bottom:14px;"><a href="#" id="report-back-to-days" style="font-size:12px;color:var(--blue);">← Back to day list</a></div>` : ''}
     ${!showDayList ? `<div class="filters"><input id="report-search" placeholder="Search customer or phone" value="${escapeHtml(window._reportSearch||'')}" /><button class="btn-outline btn" id="report-search-btn" style="padding:9px 14px;">Search</button></div>` : ''}
+    ${!showDayList && isAdmin && deliveredInView.length ? `<label style="display:flex;align-items:center;gap:8px;text-transform:none;font-weight:400;font-size:12.5px;margin-bottom:10px;">
+      <input type="checkbox" id="report-select-all-cb" style="width:auto;margin:0;" ${deliveredInView.every(o=>selectedReportIds.has(o.id))?'checked':''}> Select all Delivered orders shown (${deliveredInView.length})
+    </label>` : ''}
     ${showDayList ? (
       dayGroups.length ? dayGroups.map(g=>`<div class="day-row" data-drillday="${g.date}"><div><div class="dlabel">${escapeHtml(formatDateRangeLabel(g.date,g.date))}</div><div class="dcount">${g.count} order${g.count===1?'':'s'}</div></div><div class="dbal">${money(g.balance)}</div></div>`).join('') : '<div class="empty">No orders in this range.</div>'
     ) : (
       visibleRows.length ? `<div style="overflow-x:auto;"><table class="report">
-        <thead><tr><th>Customer</th><th>Product</th><th>Address</th><th>Status</th><th>Amount</th><th>Delivery charge</th><th>Balance</th></tr></thead>
-        <tbody>${visibleRows.map(o=>`<tr><td>${escapeHtml(o.customer)}</td><td>${escapeHtml(o.item)}${o.qty>1?' × '+o.qty:''}</td><td>${escapeHtml(o.dropoff)}</td>
+        <thead><tr>${isAdmin?'<th></th>':''}<th>Customer</th><th>Product</th><th>Address</th><th>Status</th><th>Amount</th><th>Delivery charge</th><th>Balance</th></tr></thead>
+        <tbody>${visibleRows.map(o=>{ const canSelect = isAdmin && o.status==='delivered';
+          return `<tr>${isAdmin?`<td>${canSelect?`<input type="checkbox" class="report-select-cb" data-id="${escapeHtml(o.id)}" ${selectedReportIds.has(o.id)?'checked':''} />`:''}</td>`:''}<td>${escapeHtml(o.customer)}</td><td>${escapeHtml(o.item)}${o.qty>1?' × '+o.qty:''}</td><td>${escapeHtml(o.dropoff)}</td>
           <td><span class="badge ${statusMeta(o.status).badge}">${statusMeta(o.status).label}</span></td>
-          <td>${o.amount?money(o.amount):'—'}</td><td>${o.charge?money(o.charge):'—'}</td><td><b>${money(o.balance)}</b></td></tr>`).join('')}</tbody>
-        <tfoot><tr><td colspan="4">Totals</td><td>${money(detailTotals.amount)}</td><td>${money(detailTotals.charge)}</td><td>${money(detailTotals.balance)}</td></tr></tfoot>
+          <td>${o.amount?money(o.amount):'—'}</td><td>${o.charge?money(o.charge):'—'}</td><td><b>${money(o.balance)}</b></td></tr>`; }).join('')}</tbody>
+        <tfoot><tr>${isAdmin?'<td></td>':''}<td colspan="4">Totals</td><td>${money(detailTotals.amount)}</td><td>${money(detailTotals.charge)}</td><td>${money(detailTotals.balance)}</td></tr></tfoot>
       </table></div>` : '<div class="empty">No orders in this range.</div>'
     )}
-    ${isAdmin && reportData.store ? `<div style="margin-top:18px;"><button class="btn" id="send-report-btn">Send this report to ${escapeHtml(reportData.store)}</button><p class="hint" style="margin-top:8px;">This marks every Delivered order in this range as Remitted, and notifies ${escapeHtml(reportData.store)} next time they log in.</p></div>` : ''}
+    ${isAdmin && reportData.store && deliveredInView.length ? `<div style="margin-top:18px;"><button class="btn" id="preview-report-btn" data-candidates="${deliveredInView.map(o=>escapeHtml(o.id)).join(',')}">Preview &amp; send to ${escapeHtml(reportData.store)}</button><p class="hint" style="margin-top:8px;">Opens a preview of exactly which orders (checked above, or every Delivered order shown if nothing's checked) will be marked Remitted and sent to ${escapeHtml(reportData.store)} — nothing changes until you confirm there.</p></div>` : ''}
   </div>`;
+}
+function reportPreviewModal(){
+  const items = (reportData.rows || []).filter(o=>reportPreviewIds.includes(o.id));
+  let totalAmount = 0, totalCharge = 0, totalBalance = 0;
+  items.forEach(o=>{ totalAmount += o.amount; totalCharge += o.charge; totalBalance += o.balance; });
+  return `<div class="modal-overlay" id="report-preview-overlay"><div class="modal">
+    <h3>Preview report — ${escapeHtml(reportData.store||'')}</h3>
+    <div class="id">${items.length} order(s) will be marked Remitted and sent to this store. Nothing else in this view is affected.</div>
+    ${items.map(o=>`<div class="new-order-item">${escapeHtml(o.customer)} — ${escapeHtml(o.item)}${o.qty>1?' × '+o.qty:''} — Balance: <b>${money(o.balance)}</b></div>`).join('')}
+    <p class="hint">Totals: Amount ${money(totalAmount)} · Delivery charge ${money(totalCharge)} · Balance ${money(totalBalance)}</p>
+    <div class="modal-actions"><button class="btn btn-outline" id="report-preview-cancel">Cancel</button><button class="btn" id="report-preview-confirm" ${busy?'disabled':''}>${busy?'<span class="spinner-inline"></span>':'Confirm & send'}</button></div>
+  </div></div>`;
 }
 function attachReportHandlers(isAdmin){
   const goReload = async () => {
@@ -1434,6 +1494,7 @@ function attachReportHandlers(isAdmin){
       window._reportDateQuick = btn.dataset.reportquick;
       const {from, to} = quickRangeDates(btn.dataset.reportquick);
       window._reportDateFrom = from; window._reportDateTo = to;
+      selectedReportIds = new Set();
       await goReload();
     };
   });
@@ -1443,12 +1504,13 @@ function attachReportHandlers(isAdmin){
       window._reportDateFrom = document.getElementById('report-custom-from').value;
       window._reportDateTo = document.getElementById('report-custom-to').value;
       window._reportDateQuick = 'custom';
+      selectedReportIds = new Set();
       await goReload();
     };
   }
   const storeSelect = document.getElementById('report-store-select');
   if (storeSelect){
-    storeSelect.onchange = async (e) => { window._reportStoreId = e.target.value; await goReload(); };
+    storeSelect.onchange = async (e) => { window._reportStoreId = e.target.value; selectedReportIds = new Set(); await goReload(); };
   }
   const search = document.getElementById('report-search');
   if (search){
@@ -1462,17 +1524,49 @@ function attachReportHandlers(isAdmin){
   });
   const backLink = document.getElementById('report-back-to-days');
   if (backLink) backLink.onclick = (e) => { e.preventDefault(); reportDrillDay = null; render(); };
-  const sendBtn = document.getElementById('send-report-btn');
-  if (sendBtn){
-    sendBtn.onclick = async () => {
+
+  document.querySelectorAll('.report-select-cb').forEach(cb=>{
+    cb.onchange = () => { if (cb.checked) selectedReportIds.add(cb.dataset.id); else selectedReportIds.delete(cb.dataset.id); render(); };
+  });
+  const reportSelectAll = document.getElementById('report-select-all-cb');
+  if (reportSelectAll){
+    reportSelectAll.onchange = () => {
+      document.querySelectorAll('.report-select-cb').forEach(cb=>{ if (reportSelectAll.checked) selectedReportIds.add(cb.dataset.id); else selectedReportIds.delete(cb.dataset.id); });
+      render();
+    };
+  }
+  const previewBtn = document.getElementById('preview-report-btn');
+  if (previewBtn){
+    previewBtn.onclick = () => {
+      const candidates = previewBtn.dataset.candidates ? previewBtn.dataset.candidates.split(',').filter(Boolean) : [];
+      // Whatever's explicitly checked wins; if nothing's checked, every
+      // Delivered order currently shown is treated as the candidate set —
+      // matches the button's own "or every Delivered order shown" hint text.
+      reportPreviewIds = selectedReportIds.size ? Array.from(selectedReportIds) : candidates;
+      reportPreviewStoreId = window._reportStoreId;
+      reportPreviewOpen = true;
+      render();
+    };
+  }
+  const previewOverlay = document.getElementById('report-preview-overlay');
+  if (previewOverlay){
+    // Cancel — and clicking outside the modal — closes the preview with
+    // no server call and no state change at all; only Confirm below
+    // actually sends anything.
+    document.getElementById('report-preview-cancel').onclick = () => { reportPreviewOpen = false; reportPreviewIds = []; render(); };
+    document.getElementById('report-preview-confirm').onclick = async () => {
       const range = window._reportDateQuick || 'today';
       const label = range==='today' ? 'Today' : range==='week' ? 'This week' : range==='month' ? 'This month' : range==='custom' ? 'Custom range' : 'All time';
+      busy = true; render();
       try{
-        await api('report.php', {method:'POST', body:{store_id: window._reportStoreId, range_label: label, date_from: window._reportDateFrom, date_to: window._reportDateTo}});
-        showToast(`Report sent to ${reportData.store}`);
+        const r = await api('report.php', {method:'POST', body:{store_id: reportPreviewStoreId, order_ids: reportPreviewIds, range_label: label, date_from: window._reportDateFrom, date_to: window._reportDateTo}});
+        showToast(r.skippedCount ? `Report sent — ${r.sentCount} order(s) marked Remitted, ${r.skippedCount} had already changed and were skipped` : `Report sent to ${reportData.store} — ${r.sentCount} order(s) marked Remitted`);
+        selectedReportIds = new Set(); reportPreviewOpen = false; reportPreviewIds = [];
         await goReload();
       }catch(e){ showToast(e.message); }
+      busy = false; render();
     };
+    previewOverlay.addEventListener('click', e => { if (e.target.id==='report-preview-overlay'){ reportPreviewOpen = false; reportPreviewIds = []; render(); } });
   }
 }
 
@@ -1503,8 +1597,14 @@ function printOrderSlips(list){
   const area = document.getElementById('print-area');
   if (!area) return;
   if (!list.length){ showToast('Select at least one order to print'); return; }
-  area.innerHTML = list.map(o=>`
+  area.innerHTML = list.map(o=>{
+    // Older orders (or ones that predate this column) may have no
+    // recorded history — fall back to a single synthesized entry for
+    // their current status rather than showing an empty timeline.
+    const history = (o.statusHistory && o.statusHistory.length) ? o.statusHistory : [{status:o.status, at:o.updatedAt||o.createdAt, by:o.lastUpdatedBy}];
+    return `
     <div class="slip">
+      <div class="slip-field"><b>Store:</b> ${escapeHtml(o.store)}</div>
       <div class="slip-field"><b>Date:</b> ${new Date(o.createdAt).toLocaleDateString()}</div>
       <div class="slip-field"><b>Name:</b> ${escapeHtml(o.customer)}</div>
       <div class="slip-field"><b>Address:</b> ${escapeHtml(o.dropoff)}</div>
@@ -1514,8 +1614,12 @@ function printOrderSlips(list){
         <tbody><tr><td>1</td><td>${escapeHtml(o.item)}${o.qty>1?' × '+o.qty:''}</td><td>${o.amount?o.amount.toLocaleString():''}</td></tr></tbody>
         <tfoot><tr><td colspan="2">TOTAL</td><td>${money(o.amount||0)}</td></tr></tfoot>
       </table>
+      <table class="slip-history">
+        <thead><tr><th>Status</th><th>Date</th></tr></thead>
+        <tbody>${history.map(h=>`<tr><td>${statusMeta(h.status).label}</td><td>${new Date(h.at).toLocaleString()}</td></tr>`).join('')}</tbody>
+      </table>
     </div>
-  `).join('');
+  `;}).join('');
   window.print();
 }
 function adminOrdersSection(){

@@ -95,39 +95,58 @@ if ($method === 'POST') {
     $rangeLabel = str_field($body, 'range_label') ?: 'All time';
     $dateFrom = str_field($body, 'date_from');
     $dateTo = str_field($body, 'date_to');
+    $orderIds = array_values(array_filter(array_map('strval', $body['order_ids'] ?? [])));
 
-    $stmt = $pdo->prepare('SELECT id FROM stores WHERE store_id = ? AND role = "owner"');
+    if (!$orderIds) {
+        json_error('No orders specified to send.', 400);
+    }
+
+    $stmt = $pdo->prepare('SELECT id, store_name FROM stores WHERE store_id = ? AND role = "owner"');
     $stmt->execute([$storeLoginId]);
-    $ownerRowId = $stmt->fetchColumn();
-    if (!$ownerRowId) {
+    $store = $stmt->fetch();
+    if (!$store) {
         json_error('Store not found.', 404);
     }
+    $ownerRowId = (int) $store['id'];
 
     $validFrom = preg_match('/^\d{4}-\d{2}-\d{2}$/', $dateFrom) ? $dateFrom : null;
     $validTo = preg_match('/^\d{4}-\d{2}-\d{2}$/', $dateTo) ? $dateTo : null;
 
+    $stmt = $pdo->prepare('SELECT name FROM admin_accounts WHERE id = ?');
+    $stmt->execute([$actor['row_id']]);
+    $adminName = (string) $stmt->fetchColumn();
+
     $pdo->beginTransaction();
     try {
-        $stmt = $pdo->prepare('INSERT INTO sent_reports (store_id, range_label, date_from, date_to, sent_by_admin_id) VALUES (?, ?, ?, ?, ?)');
-        $stmt->execute([$ownerRowId, $rangeLabel, $validFrom, $validTo, $actor['row_id']]);
+        // This is the money-affecting step, so nothing here is trusted from
+        // the client beyond which order codes were checked in the preview:
+        // re-select and re-validate every one of them against the current
+        // database state — must belong to this exact store, must not be
+        // deleted, and must still be Delivered right now (an order could
+        // have moved on since the preview was opened a moment ago). Only
+        // orders that pass all three get marked Remitted; anything else is
+        // silently excluded and reflected in the response counts, same
+        // "skip rather than fail the batch" principle as bulk_status.
+        $placeholders = implode(',', array_fill(0, count($orderIds), '?'));
+        $stmt = $pdo->prepare("SELECT id, order_code, status_history FROM orders
+            WHERE order_code IN ($placeholders) AND store_id = ? AND deleted = 0 AND status = 'delivered' FOR UPDATE");
+        $stmt->execute(array_merge($orderIds, [$ownerRowId]));
+        $eligible = $stmt->fetchAll();
 
-        // Mark every "Delivered" order in this filtered range as "Remitted"
-        // — meaning it's now been reported/reconciled, distinct from actual
-        // bank payment (handled separately by Withdrawals). This prevents
-        // the same delivered orders from being reported as outstanding
-        // again in a future report. Wallet balance keeps counting Remitted
-        // the same as Delivered (see store_delivered_total()).
-        $updateSql = "UPDATE orders SET status = 'remitted', updated_at = CURRENT_TIMESTAMP WHERE store_id = ? AND status = 'delivered' AND deleted = 0";
-        $updateParams = [$ownerRowId];
-        if ($validFrom !== null) {
-            $updateSql .= ' AND updated_at >= ?';
-            $updateParams[] = $validFrom . ' 00:00:00';
+        if (!$eligible) {
+            $pdo->rollBack();
+            json_error('None of the selected orders are still eligible to send (they may have changed status already). Refresh and try again.', 409);
         }
-        if ($validTo !== null) {
-            $updateSql .= ' AND updated_at <= ?';
-            $updateParams[] = $validTo . ' 23:59:59';
+
+        $eligibleCodes = array_column($eligible, 'order_code');
+        $upd = $pdo->prepare("UPDATE orders SET status = 'remitted', prev_status = 'delivered', last_updated_by_name = ?, seen_by_admin = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?");
+        foreach ($eligible as $row) {
+            $upd->execute([$adminName, $row['id']]);
+            append_status_history($pdo, (int) $row['id'], $row['status_history'], 'remitted', $adminName);
         }
-        $pdo->prepare($updateSql)->execute($updateParams);
+
+        $stmt = $pdo->prepare('INSERT INTO sent_reports (store_id, range_label, date_from, date_to, sent_by_admin_id, order_ids) VALUES (?, ?, ?, ?, ?, ?)');
+        $stmt->execute([$ownerRowId, $rangeLabel, $validFrom, $validTo, $actor['row_id'], json_encode($eligibleCodes)]);
 
         $pdo->commit();
     } catch (Throwable $e) {
@@ -137,7 +156,12 @@ if ($method === 'POST') {
         throw $e;
     }
 
-    json_response(['ok' => true], 201);
+    json_response([
+        'ok' => true,
+        'sentCount' => count($eligibleCodes),
+        'skippedCount' => count($orderIds) - count($eligibleCodes),
+        'orderIds' => $eligibleCodes,
+    ], 201);
 }
 
 json_error('Method not allowed.', 405);

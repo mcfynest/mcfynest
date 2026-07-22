@@ -45,6 +45,21 @@ function apply_stock_for_status_change(PDO $pdo, array $order, string $oldStatus
     }
 }
 
+function status_history_for_client(?string $json): array
+{
+    $history = $json ? json_decode($json, true) : null;
+    if (!is_array($history)) {
+        return [];
+    }
+    return array_map(function ($h) {
+        return [
+            'status' => $h['status'] ?? '',
+            'at' => strtotime($h['at'] ?? 'now') * 1000,
+            'by' => $h['by'] ?? '',
+        ];
+    }, $history);
+}
+
 function order_row_for_client(array $o): array
 {
     return [
@@ -71,6 +86,7 @@ function order_row_for_client(array $o): array
         'seen' => (bool) $o['seen_by_admin'],
         'isBackorder' => (bool) $o['is_backorder'],
         'stockDeducted' => (bool) $o['stock_deducted'],
+        'statusHistory' => status_history_for_client($o['status_history'] ?? null),
         'lastUpdatedBy' => $o['last_updated_by_name'],
         'createdAt' => strtotime($o['created_at']) * 1000,
         'updatedAt' => strtotime($o['updated_at']) * 1000,
@@ -192,12 +208,13 @@ if ($method === 'POST') {
         $isBackorder = $qty > $available;
 
         $orderCode = generate_order_code($pdo);
+        $initialHistory = json_encode([['status' => 'pending', 'at' => date('Y-m-d H:i:s'), 'by' => $actor['store_name'] ?? '']]);
         $stmt = $pdo->prepare('INSERT INTO orders
-            (order_code, store_id, placed_by_store_id, product_id, product_name, qty, customer_name, phone, alt_phone, delivery_address, zone, instructions, amount, is_backorder)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+            (order_code, store_id, placed_by_store_id, product_id, product_name, qty, customer_name, phone, alt_phone, delivery_address, zone, instructions, amount, is_backorder, status_history)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
         $stmt->execute([
             $orderCode, $actor['owner_row_id'], $actor['row_id'], $productId, $product['name'], $qty,
-            $customer, $phone, $altPhone ?: null, $dropoff, $zone ?: null, $notes, $amount, $isBackorder ? 1 : 0,
+            $customer, $phone, $altPhone ?: null, $dropoff, $zone ?: null, $notes, $amount, $isBackorder ? 1 : 0, $initialHistory,
         ]);
 
         $pdo->commit();
@@ -282,7 +299,7 @@ if ($method === 'PATCH') {
         $pdo->beginTransaction();
         try {
             $placeholders = implode(',', array_fill(0, count($ids), '?'));
-            $stmt = $pdo->prepare("SELECT id, order_code, status, product_id, qty, stock_deducted FROM orders WHERE order_code IN ($placeholders) AND deleted = 0 FOR UPDATE");
+            $stmt = $pdo->prepare("SELECT id, order_code, status, product_id, qty, stock_deducted, status_history FROM orders WHERE order_code IN ($placeholders) AND deleted = 0 FOR UPDATE");
             $stmt->execute($ids);
             $rows = $stmt->fetchAll();
 
@@ -298,6 +315,7 @@ if ($method === 'PATCH') {
                 }
                 $upd->execute([$status, $current, $adminName, $row['order_code']]);
                 apply_stock_for_status_change($pdo, $row, $current, $status);
+                append_status_history($pdo, (int) $row['id'], $row['status_history'], $status, $adminName);
                 $updated++;
             }
             $pdo->commit();
@@ -356,7 +374,7 @@ if ($method === 'PATCH') {
 
         $pdo->beginTransaction();
         try {
-            $stmt = $pdo->prepare('SELECT id, status, prev_status, product_id, qty, stock_deducted FROM orders WHERE order_code = ? AND deleted = 0 FOR UPDATE');
+            $stmt = $pdo->prepare('SELECT id, status, prev_status, product_id, qty, stock_deducted, status_history FROM orders WHERE order_code = ? AND deleted = 0 FOR UPDATE');
             $stmt->execute([$orderCode]);
             $order = $stmt->fetch();
             if (!$order) {
@@ -371,6 +389,7 @@ if ($method === 'PATCH') {
             $pdo->prepare('UPDATE orders SET status = ?, prev_status = NULL, last_updated_by_name = ?, seen_by_admin = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
                 ->execute([$order['prev_status'], $adminName, $order['id']]);
             apply_stock_for_status_change($pdo, $order, $oldStatus, $order['prev_status']);
+            append_status_history($pdo, (int) $order['id'], $order['status_history'], $order['prev_status'], $adminName);
             $pdo->commit();
         } catch (Throwable $e) {
             if ($pdo->inTransaction()) {
@@ -405,7 +424,7 @@ if ($method === 'PATCH') {
 
     $pdo->beginTransaction();
     try {
-        $stmt = $pdo->prepare('SELECT id, status, product_id, qty, stock_deducted FROM orders WHERE order_code = ? FOR UPDATE');
+        $stmt = $pdo->prepare('SELECT id, status, product_id, qty, stock_deducted, status_history FROM orders WHERE order_code = ? FOR UPDATE');
         $stmt->execute([$orderCode]);
         $existing = $stmt->fetch();
         if (!$existing) {
@@ -426,6 +445,7 @@ if ($method === 'PATCH') {
             $stmt = $pdo->prepare('UPDATE orders SET status=?, prev_status=?, rider=?, dispatch_note=?, delivery_fee=?, other_charges=?, charge_note=?, last_updated_by_name=?, seen_by_admin=1 WHERE order_code=?');
             $stmt->execute([$status, $currentStatus, $rider, $remark, $deliveryFee, $otherCharges, $chargeNote, $adminName, $orderCode]);
             apply_stock_for_status_change($pdo, $existing, $currentStatus, $status);
+            append_status_history($pdo, (int) $existing['id'], $existing['status_history'], $status, $adminName);
         } else {
             $stmt = $pdo->prepare('UPDATE orders SET status=?, rider=?, dispatch_note=?, delivery_fee=?, other_charges=?, charge_note=?, last_updated_by_name=?, seen_by_admin=1 WHERE order_code=?');
             $stmt->execute([$status, $rider, $remark, $deliveryFee, $otherCharges, $chargeNote, $adminName, $orderCode]);
