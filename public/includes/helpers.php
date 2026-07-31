@@ -95,6 +95,12 @@ function append_status_history(PDO $pdo, int $orderId, ?string $existingHistoryJ
     $pdo->prepare('UPDATE orders SET status_history = ? WHERE id = ?')->execute([json_encode($history), $orderId]);
 }
 
+// Statuses where no money was actually collected from the customer —
+// report/sheet rows blank the Amount for these (delivery_fee/other_charges
+// still count against the balance though; see report.php and
+// sent-reports.php, the only two places that build report rows).
+const FAILED_STATUSES = ['issue', 'cancelled', 'returned'];
+
 function money(?float $n): string
 {
     $n = $n ?? 0;

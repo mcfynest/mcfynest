@@ -15,15 +15,33 @@ upload to whichever folder you want it reachable from.
 ## Already have this live and just updating it?
 
 If you deployed this app before and are picking up a later round of
-changes (new tabs, wallet/withdrawals, expenses, reports, admin
-permissions, etc.), you don't need to repeat the whole walkthrough below
-— just:
+changes, you don't need to repeat the whole walkthrough below — just:
 
-1. **Import the new migration** — in phpMyAdmin, select your existing
-   database, go to **Import**, choose `sql/migration_002_v2_features.sql`,
-   click **Go**. It only *adds* columns/tables — your existing stores,
-   products and orders are untouched. Safe to re-run if you're ever
-   unsure whether it already applied.
+1. **Import every migration you haven't run yet, in order** — in
+   phpMyAdmin, select your existing database, go to **Import**, and run
+   each of these in sequence (skip any you're sure already applied; each
+   one is safe to re-run if you're not sure):
+   - `sql/migration_002_v2_features.sql` — wallet/withdrawals, expenses,
+     reports, admin permissions.
+   - `sql/migration_003_v3_crm_revamp.sql` — 10 order statuses, Trash
+     (soft-delete).
+   - `sql/migration_004_v3_round2_fixes.sql` — single-level Undo,
+     delivery zones, withdrawal-request tracking.
+   - `sql/migration_005_v3_round3_fixes.sql` — the stock **reservation
+     model** (physical stock is now only deducted once an order reaches
+     Delivered, not the moment it's placed) and backorders. Read the
+     comments at the top of this file before running it on a database
+     with real orders in flight — it reconciles existing stock counts to
+     match the new model.
+   - `sql/migration_006_v3_round4_fixes.sql` — per-order status history,
+     and ties a sent report to the exact order codes it covers.
+   - `sql/migration_007_v3_round5_fixes.sql` — removes the unused
+     "Shipped" status (any order sitting in it is moved to "Out for
+     delivery" first, then the status list itself drops the value). This
+     is the only new migration for round 5 — every other round 5 fix
+     (the Orders pill bug, money-blanking in reports, product renaming,
+     order detail editing, expense editing, the sent-reports sheet)
+     reuses columns that already exist as of migration 006.
 2. **Re-upload the changed files** from `public/` — safest is to
    re-upload the whole `public/` folder's contents again (File Manager
    → Extract a fresh zip over the old one, or FTP overwrite). Your own
@@ -60,10 +78,12 @@ That's it — steps 1–9 below are for a first-time install.
    first, phpMyAdmin's import uploads it directly from your browser).
 5. Click **Go**. You should see 5 tables created: `stores`,
    `admin_accounts`, `products`, `agent_products`, `orders`.
-6. Repeat the same Import steps for `sql/migration_002_v2_features.sql`
-   — this adds the wallet/withdrawals, expenses, sent-reports and
-   forgot-login tables, plus the position/permissions/bank-detail
-   columns. You should end up with 9 tables total.
+6. Repeat the same Import steps, in order, for each remaining file in
+   `sql/`: `migration_002_v2_features.sql` through
+   `migration_007_v3_round5_fixes.sql`. On a brand-new database most of
+   these have little or nothing to do (no data yet to migrate) — they're
+   still required, since each one also adds the columns/tables that
+   round of features needs.
 
 ## 3. Upload the application files
 
@@ -135,13 +155,13 @@ redirect block until it does, or visitors will hit a certificate error.
 
 ## 8. Test it
 
-1. Visit your domain. You should see the **MCFYNEST LOGISTICS** role picker.
-2. Click **Dispatch Admin**, log in with the admin ID/password from
-   step 6.
-3. Use **Create a store** to make your first store login, copy its
-   generated Store ID + password.
-4. Log out, click **Store Portal**, log in with that Store ID/password,
-   log a stock drop-off, then place a test order.
+1. Visit your domain. You should see the **MCFYNEST LOGISTICS** login
+   screen — a single Login ID field takes either a Store ID or an Admin ID.
+2. Log in with the admin ID/password from step 6.
+3. Use **Stores → Create a store** to make your first store login, copy
+   its generated Store ID + password.
+4. Log out, log back in with that Store ID/password, log a stock
+   drop-off under **Inventory**, then place a test order under **Orders**.
 5. Log back in as admin — you should see the "New orders waiting"
    popup with that test order in it.
 

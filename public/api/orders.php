@@ -6,7 +6,7 @@ $pdo = db();
 $actor = require_actor();
 $method = $_SERVER['REQUEST_METHOD'];
 
-const ORDER_STATUSES = ['pending', 'scheduled', 'shipped', 'transit', 'delivered', 'remitted', 'notpicking', 'issue', 'returned', 'cancelled'];
+const ORDER_STATUSES = ['pending', 'scheduled', 'transit', 'delivered', 'remitted', 'notpicking', 'issue', 'returned', 'cancelled'];
 // Once an order is Delivered, a direct status change may only move it
 // forward to Remitted — reversing it back to an earlier status goes
 // through the dedicated 'undo' action instead, never a regular update.
@@ -16,7 +16,7 @@ const POST_DELIVERED_ALLOWED_STATUSES = ['delivered', 'remitted'];
 // Remitted have already deducted physical stock (see stock_deducted
 // below) so they stop reserving; Cancelled/Returned never held stock
 // in the first place under this model, so they never reserved either.
-const RESERVING_STATUSES = ['pending', 'scheduled', 'shipped', 'transit', 'notpicking', 'issue'];
+const RESERVING_STATUSES = ['pending', 'scheduled', 'transit', 'notpicking', 'issue'];
 
 /**
  * Physical stock is deducted exactly once, the moment an order first
@@ -422,6 +422,19 @@ if ($method === 'PATCH') {
     $otherCharges = max(0, num_field($body, 'otherCharges', 0));
     $chargeNote = str_field($body, 'chargeNote');
 
+    // Correctable customer/contact/address fields, editable alongside the
+    // status update — lets dispatch fix a typo'd phone number or address
+    // without needing a separate flow. Required fields can't be blanked
+    // out; altPhone/zone stay optional.
+    $customer = str_field($body, 'customer');
+    $phone = str_field($body, 'phone');
+    $altPhone = str_field($body, 'altPhone');
+    $zone = str_field($body, 'zone');
+    $dropoff = str_field($body, 'dropoff');
+    if ($customer === '' || $phone === '' || $dropoff === '') {
+        json_error('Customer name, phone, and address cannot be empty.', 400);
+    }
+
     $pdo->beginTransaction();
     try {
         $stmt = $pdo->prepare('SELECT id, status, product_id, qty, stock_deducted, status_history FROM orders WHERE order_code = ? FOR UPDATE');
@@ -442,13 +455,17 @@ if ($method === 'PATCH') {
         // or not the status itself actually changed — a dispatcher who
         // opened and saved an order has "actioned" it either way.
         if ($status !== $currentStatus) {
-            $stmt = $pdo->prepare('UPDATE orders SET status=?, prev_status=?, rider=?, dispatch_note=?, delivery_fee=?, other_charges=?, charge_note=?, last_updated_by_name=?, seen_by_admin=1 WHERE order_code=?');
-            $stmt->execute([$status, $currentStatus, $rider, $remark, $deliveryFee, $otherCharges, $chargeNote, $adminName, $orderCode]);
+            $stmt = $pdo->prepare('UPDATE orders SET status=?, prev_status=?, rider=?, dispatch_note=?, delivery_fee=?, other_charges=?, charge_note=?,
+                customer_name=?, phone=?, alt_phone=?, zone=?, delivery_address=?, last_updated_by_name=?, seen_by_admin=1 WHERE order_code=?');
+            $stmt->execute([$status, $currentStatus, $rider, $remark, $deliveryFee, $otherCharges, $chargeNote,
+                $customer, $phone, $altPhone ?: null, $zone ?: null, $dropoff, $adminName, $orderCode]);
             apply_stock_for_status_change($pdo, $existing, $currentStatus, $status);
             append_status_history($pdo, (int) $existing['id'], $existing['status_history'], $status, $adminName);
         } else {
-            $stmt = $pdo->prepare('UPDATE orders SET status=?, rider=?, dispatch_note=?, delivery_fee=?, other_charges=?, charge_note=?, last_updated_by_name=?, seen_by_admin=1 WHERE order_code=?');
-            $stmt->execute([$status, $rider, $remark, $deliveryFee, $otherCharges, $chargeNote, $adminName, $orderCode]);
+            $stmt = $pdo->prepare('UPDATE orders SET status=?, rider=?, dispatch_note=?, delivery_fee=?, other_charges=?, charge_note=?,
+                customer_name=?, phone=?, alt_phone=?, zone=?, delivery_address=?, last_updated_by_name=?, seen_by_admin=1 WHERE order_code=?');
+            $stmt->execute([$status, $rider, $remark, $deliveryFee, $otherCharges, $chargeNote,
+                $customer, $phone, $altPhone ?: null, $zone ?: null, $dropoff, $adminName, $orderCode]);
         }
         $pdo->commit();
     } catch (Throwable $e) {
