@@ -11,7 +11,7 @@ $method = $_SERVER['REQUEST_METHOD'];
 // still counts against a product's reserved quantity until it reaches a
 // resolved end state (Delivered/Remitted have already deducted physical
 // stock; Cancelled/Returned never held any under this model).
-const RESERVING_STATUSES = ['pending', 'scheduled', 'shipped', 'transit', 'notpicking', 'issue'];
+const RESERVING_STATUSES = ['pending', 'scheduled', 'transit', 'notpicking', 'issue'];
 
 function attach_available_qty(array $products): array
 {
@@ -98,6 +98,49 @@ if ($method === 'POST') {
 }
 
 if ($method === 'PATCH') {
+    $body = read_json_body();
+    $action = str_field($body, 'action');
+
+    // Fixing a typo in the product name is open to both a store (its own
+    // products only) and an admin (any product) — separate from
+    // quantity, which stays admin-only below. Renaming can't be used to
+    // smuggle a quantity change (it never touches qty), so there's no
+    // integrity concern in letting a store correct its own listing.
+    if ($action === 'rename') {
+        $id = (int) ($body['id'] ?? 0);
+        $newName = str_field($body, 'name');
+        if ($id <= 0 || $newName === '') {
+            json_error('Enter a product name.', 400);
+        }
+
+        // Existence (and ownership, for a store) is checked with its own
+        // SELECT rather than trusting UPDATE's affected-row count — PDO's
+        // MySQL driver reports rows *changed*, not rows *matched*, so
+        // resaving the exact same name as a no-op edit would otherwise
+        // come back as a false "not found" even though the row is right
+        // there and the request was perfectly valid.
+        if ($actor['type'] === 'store') {
+            require_store_permission($pdo, $actor, 'inventory');
+            $stmt = $pdo->prepare('SELECT 1 FROM products WHERE id = ? AND store_id = ? AND deleted = 0');
+            $stmt->execute([$id, $actor['owner_row_id']]);
+            if (!$stmt->fetchColumn()) {
+                json_error('Product not found.', 404);
+            }
+            $pdo->prepare('UPDATE products SET name = ? WHERE id = ? AND store_id = ? AND deleted = 0')
+                ->execute([$newName, $id, $actor['owner_row_id']]);
+        } else {
+            require_admin_permission($pdo, $actor, 'inventory');
+            $stmt = $pdo->prepare('SELECT 1 FROM products WHERE id = ? AND deleted = 0');
+            $stmt->execute([$id]);
+            if (!$stmt->fetchColumn()) {
+                json_error('Product not found.', 404);
+            }
+            $pdo->prepare('UPDATE products SET name = ? WHERE id = ? AND deleted = 0')
+                ->execute([$newName, $id]);
+        }
+        json_response(['id' => $id, 'name' => $newName]);
+    }
+
     // Everything past this point is admin-only. This is a real
     // integrity fix, not a UI-only restriction: a store could
     // previously call this endpoint directly (bypassing hidden
@@ -105,13 +148,11 @@ if ($method === 'PATCH') {
     // been placed against it, or erase a logged row entirely. Both
     // quantity adjustment and row deletion/removal now require an
     // authenticated admin actor with the 'inventory' permission —
-    // stores are limited server-side to viewing their inventory and
-    // logging brand-new drop-offs (handled above in POST).
+    // stores are limited server-side to viewing their inventory,
+    // logging brand-new drop-offs (POST above), and renaming their own
+    // products (handled above).
     require_admin();
     require_admin_permission($pdo, $actor, 'inventory');
-
-    $body = read_json_body();
-    $action = str_field($body, 'action');
 
     $stmt = $pdo->prepare('SELECT name FROM admin_accounts WHERE id = ?');
     $stmt->execute([$actor['row_id']]);

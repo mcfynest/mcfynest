@@ -9,12 +9,11 @@
 const STATUSES = [
   {v:'pending', label:'Pending dispatch', badge:'badge-pending', dim:'var(--orange-dim)', solid:'var(--orange)'},
   {v:'scheduled', label:'Scheduled', badge:'badge-scheduled', dim:'var(--purple-dim)', solid:'var(--purple)'},
-  {v:'shipped', label:'Shipped', badge:'badge-shipped', dim:'var(--teal-dim)', solid:'var(--teal)'},
   {v:'transit', label:'Out for delivery', badge:'badge-transit', dim:'var(--blue-dim)', solid:'var(--blue)'},
   {v:'delivered', label:'Delivered', badge:'badge-delivered', dim:'var(--green-dim)', solid:'var(--green)'},
   {v:'remitted', label:'Remitted', badge:'badge-remitted', dim:'var(--pink-dim)', solid:'var(--pink)'},
   {v:'notpicking', label:'Not picking calls', badge:'badge-notpicking', dim:'var(--gold-dim)', solid:'var(--gold)'},
-  {v:'issue', label:'Issue / unreachable', badge:'badge-issue', dim:'var(--red-dim)', solid:'var(--red)'},
+  {v:'issue', label:'Failed delivery', badge:'badge-issue', dim:'var(--red-dim)', solid:'var(--red)'},
   {v:'returned', label:'Returned', badge:'badge-returned', dim:'var(--purple-dim)', solid:'var(--purple)'},
   {v:'cancelled', label:'Cancelled', badge:'badge-cancelled', dim:'#EAEAEA', solid:'#666'},
 ];
@@ -59,7 +58,10 @@ let myOrders = [];
 let myAgents = [];
 let myWallet = {balance:0, history:[], requestedToday:false};
 let myBank = {bankName:null, accountNumber:null, accountName:null};
-let mySentReports = [];
+let mySentReports = [];       // unacknowledged reports (login popup)
+let mySentReportsHistory = []; // every report ever sent to this store, newest-first
+let sentReportViewId = null;  // when set, the store is viewing this report's full sheet
+let sentReportSheet = null;   // the loaded sheet data for sentReportViewId
 
 // Admin in-memory caches
 let adminOrders = [];
@@ -102,6 +104,7 @@ let expandedStores = new Set();
 let selectedOrderIds = new Set();
 let selectedInvIds = new Set();
 let selectedReportIds = new Set();
+let editingExpenseId = null;
 let reportPreviewOpen = false;
 let reportPreviewIds = [];     // order codes the preview modal is currently showing
 let reportPreviewStoreId = ''; // the store login ID the preview will send to (needed for the POST, distinct from the display name)
@@ -307,7 +310,16 @@ function checkForLowStockAdmin(){
   if (low.length > 0){ lowStockAdminPopupOpen = true; }
 }
 async function checkForSentReports(){
-  try{ const r = await api('sent-reports.php'); mySentReports = r.pending; if (mySentReports.length){ reportPopupOpen = true; } }catch(e){}
+  try{ const r = await api('sent-reports.php'); mySentReports = r.pending; mySentReportsHistory = r.history || []; if (mySentReports.length){ reportPopupOpen = true; } }catch(e){}
+}
+async function loadSentReportsHistory(){
+  const r = await api('sent-reports.php');
+  mySentReports = r.pending;
+  mySentReportsHistory = r.history || [];
+}
+async function loadSentReportSheet(id){
+  sentReportViewId = id;
+  sentReportSheet = await api('sent-reports.php?id=' + id);
 }
 function checkForLowStock(){
   if (myProducts.some(i=>availableQty(i)<=POPUP_LOW_STOCK_THRESHOLD)){ lowStockPopupOpen = true; }
@@ -632,7 +644,7 @@ function sectionContent(){
     if (activeSection==='inventory' && perms.inventory) return inventorySection(true);
     if (activeSection==='team' && actor.is_primary) return storeTeamPanel(myProducts, myAgents);
     if (activeSection==='wallet') return storeWalletPanel();
-    if (activeSection==='report') return reportPanel(false, null);
+    if (activeSection==='report') return sentReportsHistoryPanel() + (sentReportViewId ? '' : reportPanel(false, null));
     if (activeSection==='account') return accountPanel();
     return storeOrdersSection();
   }
@@ -803,7 +815,7 @@ function attachShellHandlers(){
       // plain left-click is intercepted to navigate instantly in-page.
       if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
       e.preventDefault();
-      activeSection = el.dataset.section; onceCred=null; selectedOrderIds=new Set(); selectedInvIds=new Set(); reportDrillDay=null; sidebarOpen=false; showMyTrash=false; window._invDrillStore=null; window._zoneDrill=null;
+      activeSection = el.dataset.section; onceCred=null; selectedOrderIds=new Set(); selectedInvIds=new Set(); reportDrillDay=null; sidebarOpen=false; showMyTrash=false; editingExpenseId=null; sentReportViewId=null; sentReportSheet=null; window._invDrillStore=null; window._zoneDrill=null;
       render();
       try{
         if (activeSection === 'stores' && actor.type==='admin'){ await loadResetRequests('store'); render(); }
@@ -819,6 +831,7 @@ function attachShellHandlers(){
             window._reportStoreId = reportData.storeOptions[0].store_id;
             await loadReportData(window._reportStoreId, window._reportSearch);
           }
+          if (actor.type==='store') await loadSentReportsHistory();
           render();
         }
       }catch(e){ showToast(e.message); }
@@ -912,18 +925,23 @@ function attachDateFilterHandlers(activeKey, onApply){
 
 /* ---------------- STATUS PILLS (replaces stat-number boxes) ---------------- */
 function statusPillRow(list, allForCounts, filterKey){
-  const filterStatus = window[filterKey] || 'all';
+  // Default (nothing picked yet) is 'pending' — the Orders view opens on
+  // "New" rather than "everything" — with 'all' as a real, separately
+  // selectable pill for "every order regardless of status". These two
+  // used to collide: the "New" pill was wired to the *same* 'all' filter
+  // value, so it displayed the pending count but, when clicked, actually
+  // showed every order — and there was no way to see a genuine unfiltered
+  // list at all. Kept as two distinct values so both pills do what they say.
+  const filterStatus = window[filterKey] || 'pending';
   const counts = {}; STATUSES.forEach(s=>counts[s.v]=0);
   allForCounts.forEach(o=>counts[o.status]=(counts[o.status]||0)+1);
   const allActive = filterStatus==='all';
-  // "New" (was "Active") shows only orders still in Pending dispatch —
-  // i.e. orders dispatch hasn't touched yet. The moment an order moves to
-  // any other status it drops out of this default view; find it under
-  // that status's own pill instead.
+  const newActive = filterStatus==='pending';
   const newCount = counts['pending'] || 0;
   return `<div class="pill-row">
-    <div class="pill" data-statfilter="all" data-statkey="${filterKey}" title="New, unactioned orders only — once an order has been moved to any other status, find it under that status's own pill" style="${allActive?`background:var(--ink);color:#fff;border-color:var(--ink);`:`background:#fff;color:var(--ink);border-color:var(--ink);`}">New <span class="cnt" style="${allActive?'color:#cfd8e0;':''}">(${newCount})</span></div>
-    ${STATUSES.map(s=>{ const active=filterStatus===s.v;
+    <div class="pill" data-statfilter="pending" data-statkey="${filterKey}" title="New, unactioned orders only — once an order has been moved to any other status, find it under that status's own pill" style="${newActive?`background:var(--ink);color:#fff;border-color:var(--ink);`:`background:#fff;color:var(--ink);border-color:var(--ink);`}">New <span class="cnt" style="${newActive?'color:#cfd8e0;':''}">(${newCount})</span></div>
+    <div class="pill" data-statfilter="all" data-statkey="${filterKey}" title="Every order, regardless of status" style="${allActive?`background:var(--ink);color:#fff;border-color:var(--ink);`:`background:#fff;color:var(--ink);border-color:var(--ink);`}">All <span class="cnt" style="${allActive?'color:#cfd8e0;':''}">(${allForCounts.length})</span></div>
+    ${STATUSES.filter(s=>s.v!=='pending').map(s=>{ const active=filterStatus===s.v;
       return `<div class="pill" data-statfilter="${s.v}" data-statkey="${filterKey}" style="${active?`background:${s.solid};color:#fff;border-color:${s.solid};`:`background:${s.dim};color:${s.solid};border-color:${s.solid};`}">${s.label} <span class="cnt" style="${active?'color:rgba(255,255,255,.75);':`color:${s.solid};opacity:.7;`}">(${counts[s.v]})</span></div>`;
     }).join('')}
   </div>`;
@@ -1031,9 +1049,8 @@ function storeOrdersListPanel(mine){
   const sorted = mine.slice().sort((a,b)=>b.createdAt-a.createdAt);
   const searchTerm = (window._historySearch||'').toLowerCase();
   let list = sorted;
-  const filterStatus = window._historyStatFilter || 'all';
+  const filterStatus = window._historyStatFilter || 'pending';
   if (filterStatus!=='all') list = list.filter(o=>o.status===filterStatus);
-  else list = list.filter(o=>o.status==='pending');
   if (searchTerm) list = list.filter(o=>o.customer.toLowerCase().includes(searchTerm) || o.phone.toLowerCase().includes(searchTerm) || o.id.toLowerCase().includes(searchTerm));
 
   return `<div class="panel">
@@ -1093,7 +1110,7 @@ function invRow(i, isAdmin){
   const low = available<=LOW_STOCK_THRESHOLD;
   return `<div class="inv-row">
     ${isAdmin ? `<input type="checkbox" class="inv-select-cb" data-id="${i.id}" ${selectedInvIds.has(i.id)?'checked':''} />` : '<div></div>'}
-    <div><div class="inv-name">${escapeHtml(i.name)}${isAdmin && i.store_name ? ` <span class="mono" style="color:var(--slate);font-size:11px;">${escapeHtml(i.store_name)}</span>` : ''}</div>
+    <div><div class="inv-name">${escapeHtml(i.name)}${isAdmin && i.store_name ? ` <span class="mono" style="color:var(--slate);font-size:11px;">${escapeHtml(i.store_name)}</span>` : ''} <button class="row-btn btn-sm" data-inv-rename="${i.id}" title="Fix the product name" style="padding:2px 8px;font-size:10px;">Edit name</button></div>
       ${i.dropped_off_at ? `<div class="inv-date">Dropped off ${escapeHtml(i.dropped_off_at)}</div>` : ''}
       ${reserved>0 ? `<div class="inv-date">${reserved} reserved by order(s) not yet delivered</div>` : ''}
       ${i.qty_updated_at && i.qty_updated_by ? `<div class="inv-date">Last updated ${new Date(i.qty_updated_at.replace(' ','T')).toLocaleString()} by ${escapeHtml(i.qty_updated_by)}</div>` : ''}</div>
@@ -1119,6 +1136,26 @@ function storeInventoryPanel(myInv){
     </div>`;
 }
 function attachInventoryHandlers(){
+  // Renaming is available to both roles (store: its own products only;
+  // admin: any product) — separate from quantity, which stays admin-only.
+  document.querySelectorAll('[data-inv-rename]').forEach(btn=>{
+    btn.onclick = async () => {
+      const id = parseInt(btn.dataset.invRename, 10);
+      const pool = actor.type==='store' ? myProducts : adminProducts;
+      const item = pool.find(i=>i.id===id);
+      const newName = prompt('Fix the product name:', item ? item.name : '');
+      if (newName === null) return;
+      const trimmed = newName.trim();
+      if (!trimmed){ showToast('Product name cannot be empty'); return; }
+      try{
+        await api('products.php', {method:'PATCH', body:{action:'rename', id, name:trimmed}});
+        if (actor.type==='store') await loadStoreData(); else await loadAdminData();
+        showToast('Product name updated');
+        render();
+      }catch(e){ showToast(e.message); }
+    };
+  });
+
   if (actor.type==='store'){
     const addInvBtn = document.getElementById('inv-add-btn');
     if (addInvBtn){
@@ -1369,10 +1406,40 @@ function attachWalletHandlers(){
 function sentReportPopup(pending){
   return `<div class="modal-overlay" id="sentreport-overlay"><div class="modal">
     <h3>Your dispatch team sent a report</h3>
-    <div class="id">${pending.length} report${pending.length>1?'s':''} ready for you to review</div>
-    ${pending.map(r=>`<div class="new-order-item">📅 ${escapeHtml(formatDateRangeLabel(r.dateFrom, r.dateTo))} — sent ${new Date(r.sentAt).toLocaleString()}. Open the Report section to see the full breakdown.</div>`).join('')}
+    <div class="id">${pending.length} report${pending.length>1?'s':''} ready for you to review — click one to open it</div>
+    ${pending.map(r=>`<div class="new-order-item" data-open-report-popup="${r.id}" style="cursor:pointer;">📅 ${escapeHtml(formatDateRangeLabel(r.dateFrom, r.dateTo))} — sent ${new Date(r.sentAt).toLocaleString()}.</div>`).join('')}
     <div class="modal-actions"><button class="btn" id="sentreport-ack-btn">Got it</button></div>
     </div></div>`;
+}
+function formatReportRangeLabel(r){ return formatDateRangeLabel(r.dateFrom, r.dateTo); }
+function sentReportsHistoryPanel(){
+  if (sentReportViewId){
+    if (!sentReportSheet) return `<div class="panel"><div class="empty">Loading…</div></div>`;
+    return `<div class="panel">
+      <button class="btn-outline btn btn-sm" id="sent-report-back-btn" style="margin-bottom:14px;">← Back to sent reports</button>
+      ${renderReportSheet(sentReportSheet)}
+    </div>`;
+  }
+  return `<div class="panel">
+    <h2><span class="dot"></span>Sent reports</h2>
+    <p class="hint">Reports your dispatch team has sent you, newest first. Click one to see the full breakdown.</p>
+    ${mySentReportsHistory.length ? mySentReportsHistory.map(r=>`<div class="day-row" data-open-report="${r.id}">
+      <div><div class="dlabel">${escapeHtml(formatReportRangeLabel(r))}${!r.acknowledged?' <span class="badge badge-pending">new</span>':''}</div><div class="dcount">${r.orderCount} order${r.orderCount===1?'':'s'} · sent ${new Date(r.sentAt).toLocaleString()}</div></div>
+      <div class="dbal">▸</div>
+    </div>`).join('') : '<div class="empty">No reports sent yet.</div>'}
+  </div>`;
+}
+function renderReportSheet(sheet){
+  const rows = sheet.rows || [];
+  const totals = sheet.totals || {amount:0, charge:0, balance:0};
+  return `<div class="sheet-view">
+    <div class="sheet-header"><b>${escapeHtml(sheet.store||'')}</b><span>${escapeHtml(formatDateRangeLabel(sheet.dateFrom, sheet.dateTo))} · sent ${new Date(sheet.sentAt).toLocaleString()}</span></div>
+    <table class="report"><thead><tr><th>Name</th><th>Product</th><th>Location</th><th>Status</th><th>Amount</th><th>Delivery charge</th><th>Balance</th></tr></thead>
+    <tbody>${rows.map(o=>`<tr><td>${escapeHtml(o.customer)}</td><td>${escapeHtml(o.item)}${o.qty>1?' × '+o.qty:''}</td><td>${escapeHtml(o.dropoff)}</td>
+      <td><span class="badge ${statusMeta(o.status).badge}">${statusMeta(o.status).label}</span></td>
+      <td>${o.amount?money(o.amount):'—'}</td><td>${o.charge?money(o.charge):'—'}</td><td><b>${money(o.balance)}</b></td></tr>`).join('')}</tbody>
+    <tfoot><tr><td colspan="4">Totals</td><td>${money(totals.amount)}</td><td>${money(totals.charge)}</td><td>${money(totals.balance)}</td></tr></tfoot></table>
+  </div>`;
 }
 function lowStockPopup(){
   const low = myProducts.filter(i=>availableQty(i)<=POPUP_LOW_STOCK_THRESHOLD);
@@ -1585,11 +1652,10 @@ function exportOrdersCsv(list){
  * search, store, date range) — shared by CSV export and the Print
  * slips fallback (used when nothing is checkbox-selected). */
 function currentFilteredAdminOrders(){
-  const filterStatus = window._filterStatus || 'all';
+  const filterStatus = window._filterStatus || 'pending';
   const searchTerm = (window._searchTerm || '').toLowerCase();
   let list = adminOrders.slice().sort((a,b)=>b.createdAt-a.createdAt);
   if (filterStatus !== 'all') list = list.filter(o=>o.status===filterStatus);
-  else list = list.filter(o=>o.status==='pending');
   if (searchTerm) list = list.filter(o=>o.customer.toLowerCase().includes(searchTerm)||o.phone.toLowerCase().includes(searchTerm)||o.id.toLowerCase().includes(searchTerm));
   return list;
 }
@@ -1627,9 +1693,8 @@ function adminOrdersSection(){
   const filterStore = window._filterStore || 'all';
   const searchTerm = (window._searchTerm || '').toLowerCase();
   let list = adminOrders.slice().sort((a,b)=>b.createdAt-a.createdAt);
-  const filterStatus = window._filterStatus || 'all';
+  const filterStatus = window._filterStatus || 'pending';
   if (filterStatus!=='all') list = list.filter(o=>o.status===filterStatus);
-  else list = list.filter(o=>o.status==='pending');
   if (searchTerm) list = list.filter(o=>
     o.customer.toLowerCase().includes(searchTerm) || o.phone.toLowerCase().includes(searchTerm) || o.id.toLowerCase().includes(searchTerm)
   );
@@ -1678,6 +1743,12 @@ function updateModal(o){
   const statusOptions = isDelivered ? STATUSES.filter(s=>s.v==='delivered'||s.v==='remitted') : STATUSES;
   return `<div class="modal-overlay" id="modal-overlay"><div class="modal">
     <h3>${escapeHtml(o.item)}${o.qty>1?' × '+o.qty:''}</h3><div class="id mono">#${escapeHtml(o.id)} · ${escapeHtml(o.store)}</div>
+    <p class="hint" style="margin-top:-8px;">Fix any mistakes below (customer details, phone, address) alongside the status update.</p>
+    <div class="row2"><div><label>Customer name</label><input id="modal-customer" value="${escapeHtml(o.customer||'')}" /></div>
+    <div><label>Phone number</label><input id="modal-phone" value="${escapeHtml(o.phone||'')}" /></div></div>
+    <div class="row2"><div><label>Alternate phone</label><input id="modal-altphone" value="${escapeHtml(o.altPhone||'')}" /></div>
+    <div><label>Delivery zone / area</label><input id="modal-zone" value="${escapeHtml(o.zone||'')}" list="zone-suggestions" /><datalist id="zone-suggestions">${COMMON_ZONES.map(z=>`<option value="${z}">`).join('')}</datalist></div></div>
+    <label>Delivery address</label><input id="modal-dropoff" value="${escapeHtml(o.dropoff||'')}" />
     <label>Status</label><select id="modal-status">${statusOptions.map(s=>`<option value="${s.v}" ${s.v===o.status?'selected':''}>${s.label}</option>`).join('')}</select>
     ${isDelivered?`<p class="hint" style="margin-bottom:16px;">This order is Delivered — from here it can only move forward to Remitted. If it was marked Delivered by mistake, close this and use the <b>Undo</b> button on the order instead.</p>`:''}
     <label>Rider / driver (optional)</label><input id="modal-rider" value="${escapeHtml(o.rider||'')}" placeholder="e.g. Tunde" />
@@ -2105,9 +2176,24 @@ function adminExpensesPanel(){
           <span class="badge ${e.type==='rider'?'badge-role':'badge-ok'}">${e.type==='rider'?'rider':'other'}</span>
           <div class="admin-main"><div class="item">${escapeHtml(e.desc||'—')}${e.orderRef?' · Order #'+escapeHtml(e.orderRef):''}</div><div class="sub">${escapeHtml(e.date)}${e.note?' · '+escapeHtml(e.note):''}</div></div>
           <div style="font-weight:900;">${money(e.amount)}</div>
-          <button class="admin-update-btn" data-expense-remove="${e.id}">Remove</button>
+          <div style="display:flex;gap:8px;"><button class="admin-update-btn" data-expense-edit="${e.id}">Edit</button><button class="admin-update-btn" data-expense-remove="${e.id}">Remove</button></div>
         </div>`).join('') : '<div class="empty">No expenses logged in this range.</div>'}
-    </div>`;
+    </div>
+    ${editingExpenseId ? editExpenseModal() : ''}`;
+}
+function editExpenseModal(){
+  const e = (adminExpenses.expenses || []).find(x=>x.id===editingExpenseId);
+  if (!e) return '';
+  return `<div class="modal-overlay" id="expense-edit-overlay"><div class="modal">
+    <h3>Edit expense</h3>
+    <label>Type</label><select id="exp-edit-type"><option value="rider" ${e.type==='rider'?'selected':''}>Rider payment</option><option value="other" ${e.type==='other'?'selected':''}>Other expense</option></select>
+    <label>Rider name / description</label><input id="exp-edit-desc" value="${escapeHtml(e.desc||'')}" />
+    <label>Amount</label><input id="exp-edit-amount" type="number" min="0" value="${e.amount}" />
+    <label>Order # (optional)</label><input id="exp-edit-order" value="${escapeHtml(e.orderRef||'')}" />
+    <label>Date</label><input id="exp-edit-date" type="date" value="${escapeHtml(e.date||'')}" />
+    <label>Note (optional)</label><input id="exp-edit-note" value="${escapeHtml(e.note||'')}" />
+    <div class="modal-actions"><button class="btn btn-outline" id="exp-edit-cancel">Cancel</button><button class="btn" id="exp-edit-save" ${busy?'disabled':''}>${busy?'<span class="spinner-inline"></span>':'Save changes'}</button></div>
+  </div></div>`;
 }
 function attachExpensesHandlers(){
   if (actor.type!=='admin') return;
@@ -2150,6 +2236,31 @@ function attachExpensesHandlers(){
       catch(e){ showToast(e.message); }
     };
   });
+  document.querySelectorAll('[data-expense-edit]').forEach(btn=>{
+    btn.onclick = () => { editingExpenseId = parseInt(btn.dataset.expenseEdit, 10); render(); };
+  });
+  const expEditOverlay = document.getElementById('expense-edit-overlay');
+  if (expEditOverlay){
+    document.getElementById('exp-edit-cancel').onclick = () => { editingExpenseId = null; render(); };
+    document.getElementById('exp-edit-save').onclick = async () => {
+      const type = document.getElementById('exp-edit-type').value;
+      const desc = document.getElementById('exp-edit-desc').value.trim();
+      const amount = parseFloat(document.getElementById('exp-edit-amount').value) || 0;
+      const orderRef = document.getElementById('exp-edit-order').value.trim();
+      const date = document.getElementById('exp-edit-date').value || todayStr();
+      const note = document.getElementById('exp-edit-note').value.trim();
+      if (!desc || amount<=0){ showToast('Enter a description and a valid amount'); return; }
+      busy = true; render();
+      try{
+        await api('expenses.php', {method:'PATCH', body:{id:editingExpenseId, type, desc, amount, orderRef, date, note}});
+        editingExpenseId = null;
+        await loadExpenses();
+        showToast('Expense updated');
+      }catch(e){ showToast(e.message); }
+      busy = false; render();
+    };
+    expEditOverlay.addEventListener('click', e => { if (e.target.id==='expense-edit-overlay'){ editingExpenseId = null; render(); } });
+  }
 }
 
 /* ---------------- ADMIN: CUSTOMERS (repeat-customer tracking) ---------------- */
@@ -2292,12 +2403,18 @@ function attachPopupHandlers(){
       const deliveryFee = parseFloat(document.getElementById('modal-delivery-fee').value) || 0;
       const otherCharges = parseFloat(document.getElementById('modal-other-charges').value) || 0;
       const chargeNote = document.getElementById('modal-charge-note').value.trim();
+      const customer = document.getElementById('modal-customer').value.trim();
+      const phone = document.getElementById('modal-phone').value.trim();
+      const altPhone = document.getElementById('modal-altphone').value.trim();
+      const zone = document.getElementById('modal-zone').value.trim();
+      const dropoff = document.getElementById('modal-dropoff').value.trim();
+      if (!customer || !phone || !dropoff){ showToast('Customer name, phone, and address cannot be empty'); return; }
       if (status === 'delivered' && deliveryFee <= 0){
         if (!confirm('This order has no delivery fee attached. Continue moving it to Delivered anyway?')) return;
       }
       busy = true; render();
       try{
-        await api('orders.php', {method:'PATCH', body:{id: modalOrder.id, status, rider, remark, deliveryFee, otherCharges, chargeNote}});
+        await api('orders.php', {method:'PATCH', body:{id: modalOrder.id, status, rider, remark, deliveryFee, otherCharges, chargeNote, customer, phone, altPhone, zone, dropoff}});
         modalOrder = null;
         await reloadAdminOrdersWithDate();
         await loadAdminData(); // status change can move physical stock (Delivered deducts, reversing credits back)
@@ -2328,7 +2445,31 @@ function attachPopupHandlers(){
       try{ await api('sent-reports.php', {method:'POST', body:{action:'ack'}}); mySentReports = []; reportPopupOpen = false; render(); }
       catch(e){ showToast(e.message); }
     };
+    // Clicking a specific report in the popup jumps straight into its
+    // sheet — no need to close the popup, find the Report tab, then find
+    // the right report a second time.
+    document.querySelectorAll('[data-open-report-popup]').forEach(el=>{
+      el.onclick = async () => {
+        const id = parseInt(el.dataset.openReportPopup, 10);
+        try{
+          await api('sent-reports.php', {method:'POST', body:{action:'ack'}});
+          mySentReports = []; reportPopupOpen = false;
+          activeSection = 'report';
+          await loadSentReportSheet(id);
+          await loadSentReportsHistory();
+          render();
+        }catch(e){ showToast(e.message); }
+      };
+    });
   }
+  document.querySelectorAll('[data-open-report]').forEach(row=>{
+    row.onclick = async () => {
+      try{ await loadSentReportSheet(parseInt(row.dataset.openReport, 10)); render(); }
+      catch(e){ showToast(e.message); }
+    };
+  });
+  const sentReportBackBtn = document.getElementById('sent-report-back-btn');
+  if (sentReportBackBtn) sentReportBackBtn.onclick = () => { sentReportViewId = null; sentReportSheet = null; render(); };
   const lowOverlay = document.getElementById('lowstock-overlay');
   if (lowOverlay){
     const closeBtn = document.getElementById('lowstock-close');

@@ -71,6 +71,37 @@ if ($method === 'POST') {
     json_response(['id' => (int) $pdo->lastInsertId()], 201);
 }
 
+if ($method === 'PATCH') {
+    $body = read_json_body();
+    $id = (int) ($body['id'] ?? 0);
+    $type = str_field($body, 'type') === 'rider' ? 'rider' : 'other';
+    $desc = str_field($body, 'desc');
+    $amount = num_field($body, 'amount', 0);
+    $orderRef = str_field($body, 'orderRef');
+    $date = str_field($body, 'date');
+    $note = str_field($body, 'note');
+
+    if ($id <= 0 || $desc === '' || $amount <= 0) {
+        json_error('Enter a description and a valid amount.', 400);
+    }
+    if ($date === '' || !preg_match('/^\d{4}-\d{2}-\d{2}$/', $date)) {
+        $date = date('Y-m-d');
+    }
+
+    // Checked with its own SELECT, not the UPDATE's affected-row count —
+    // saving a no-op edit (nothing actually changed) would otherwise come
+    // back as a false "not found" (see the same fix in products.php's
+    // rename action for the full explanation).
+    $stmt = $pdo->prepare('SELECT 1 FROM expenses WHERE id = ?');
+    $stmt->execute([$id]);
+    if (!$stmt->fetchColumn()) {
+        json_error('Expense not found.', 404);
+    }
+    $pdo->prepare('UPDATE expenses SET type = ?, description = ?, amount = ?, order_ref = ?, expense_date = ?, note = ? WHERE id = ?')
+        ->execute([$type, $desc, $amount, $orderRef ?: null, $date, $note ?: null, $id]);
+    json_response(['ok' => true]);
+}
+
 if ($method === 'DELETE') {
     $body = read_json_body();
     $id = (int) ($body['id'] ?? 0);

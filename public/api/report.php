@@ -57,7 +57,11 @@ if ($method === 'GET') {
     $totalBalance = 0.0;
     $rows = array_map(function ($o) use (&$totalAmount, &$totalCharge, &$totalBalance) {
         $charge = (float) $o['delivery_fee'] + (float) $o['other_charges'];
-        $amount = (float) $o['amount'];
+        // Failed delivery/Cancelled/Returned orders never actually
+        // collected money from the customer — Amount shows blank for
+        // these, but the delivery charge still counts against the
+        // balance (a failed-delivery attempt fee is real cost either way).
+        $amount = in_array($o['status'], FAILED_STATUSES, true) ? 0.0 : (float) $o['amount'];
         $balance = $amount - $charge;
         $totalAmount += $amount;
         $totalCharge += $charge;
