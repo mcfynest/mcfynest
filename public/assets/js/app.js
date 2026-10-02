@@ -131,8 +131,8 @@ async function api(path, {method='GET', body=null} = {}){
   try{ res = await fetch('api/' + path, opts); }
   catch(e){ throw new Error('Network error — check your connection and try again.'); }
 
-  let data = null;
-  try{ data = await res.json(); }catch(e){ /* no body */ }
+  let data = null, rawText = '';
+  try{ rawText = await res.text(); data = rawText ? JSON.parse(rawText) : null; }catch(e){ data = null; }
 
   if (res.status === 419){
     try{ const s = await (await fetch('api/session.php', {credentials:'same-origin'})).json(); csrfToken = s.csrf_token; }catch(e){}
@@ -146,6 +146,17 @@ async function api(path, {method='GET', body=null} = {}){
   }
   if (!res.ok){
     throw new Error((data && data.error) || ('Something went wrong (' + res.status + ').'));
+  }
+  // Every endpoint answers with a JSON object. A success status with
+  // anything else (an empty body, or an HTML page from the web host —
+  // e.g. a security/bot-check page, or a PHP error page) used to come
+  // back as null here and crash whichever caller read a field off it
+  // ("Cannot read properties of null"). Fail loudly instead, and log what
+  // the server actually sent so it can be identified.
+  if (data === null || typeof data !== 'object'){
+    console.error('[api] ' + method + ' api/' + path + ' — HTTP ' + res.status + (res.redirected ? ' (redirected to ' + res.url + ')' : '') +
+      ', content-type ' + (res.headers.get('content-type') || 'none') + ', non-JSON body (first 500 chars):\n' + rawText.slice(0, 500));
+    throw new Error('The server sent an unexpected response. Please try again — if it keeps happening, refresh the page.');
   }
   return data;
 }
@@ -162,12 +173,17 @@ async function boot(){
   document.addEventListener('click', ()=>{ lastActivityAt = Date.now(); });
   document.addEventListener('keydown', ()=>{ lastActivityAt = Date.now(); });
 
-  try{
-    const s = await api('session.php');
-    csrfToken = s.csrf_token;
-    appMeta = {app_name: s.app_name || 'McFynest Logistics', currency: s.currency || '₦'};
-    actor = s.actor;
-  }catch(e){ /* stay logged out */ }
+  // One retry: a single bad response here would otherwise drop a
+  // still-logged-in user onto the login screen.
+  for (let attempt = 0; attempt < 2; attempt++){
+    try{
+      const s = await api('session.php');
+      csrfToken = s.csrf_token;
+      appMeta = {app_name: s.app_name || 'McFynest Logistics', currency: s.currency || '₦'};
+      actor = s.actor;
+      break;
+    }catch(e){ /* stay logged out */ }
+  }
   booted = true;
   if (actor && actor.type === 'store'){
     const hashSection = location.hash.slice(1);
