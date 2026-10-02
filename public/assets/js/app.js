@@ -100,6 +100,8 @@ let greetingDismissed = false;
 let greetingMsg = '';
 let resetPwTarget = null;   // {kind:'agent'|'store'|'admin', id, label}
 let onceCred = null;        // {label, storeId, password} shown right after creating/resetting a login
+let sheetKeyView = null;    // {label, key, storeRowId} — admin: a store's Sheet API key, shown right after reveal/regenerate
+let mySheetKey = null;      // store owner: their own Sheet API key once they've chosen to show it (view-only)
 let expandedStores = new Set();
 let selectedOrderIds = new Set();
 let selectedInvIds = new Set();
@@ -632,6 +634,7 @@ function appShell(){
       ${lowStockPopupOpen && actor.type==='store' ? lowStockPopup() : ''}
       ${pwChangeOpen ? passwordChangeModal() : ''}
       ${onceCred ? onceCredBox() : ''}
+      ${sheetKeyView ? sheetKeyBox() : ''}
       ${resetPwTarget ? resetPasswordModal() : ''}
       ${reportPreviewOpen && actor.type==='admin' ? reportPreviewModal() : ''}
     </div>
@@ -669,7 +672,58 @@ function accountPanel(){
   return `<div class="panel"><h2><span class="dot"></span>Account</h2>
     <p class="hint">Logged in as: <b>${label}</b></p>
     <button class="btn" id="pw-change-open-btn">Change password</button>
+  </div>${actor.type==='store' && actor.is_primary ? sheetSyncPanel() : ''}`;
+}
+/* Store owner: view-only Sheet API key for the Google Sheet sync script.
+   Regenerating is admin-only, so an owner can't accidentally break their
+   own working script. */
+function sheetImportUrl(){ return new URL('api/sheet-import.php', location.href).href; }
+function sheetSyncPanel(){
+  return `<div class="panel"><h2><span class="dot"></span>Google Sheet sync</h2>
+    <p class="hint">Orders typed into your store's Google Sheet are sent here automatically by the McFynest sync script. The script needs this address and your store's Sheet API key.</p>
+    <label>API URL</label>
+    <div class="mono" style="word-break:break-all;margin-bottom:12px;">${escapeHtml(sheetImportUrl())}</div>
+    <label>Sheet API key</label>
+    ${mySheetKey ? `
+      <div class="mono" id="sheet-key-value" style="word-break:break-all;font-weight:800;margin-bottom:8px;">${escapeHtml(mySheetKey)}</div>
+      <button class="btn btn-sm" data-copy-sheet-key="${escapeHtml(mySheetKey)}">Copy key</button>
+      <button class="btn btn-sm btn-outline" id="sheet-key-hide">Hide</button>
+      <p class="hint" style="margin-top:10px;">Keep this private — anyone with it can create orders for your store. It's different from your login password. If it ever leaks or you need a new one, ask McFynest admin to regenerate it.</p>`
+    : `<div><button class="btn btn-outline" id="sheet-key-show">Show my Sheet API key</button></div>`}
   </div>`;
+}
+async function copyText(text, fallbackElId){
+  try{ await navigator.clipboard.writeText(text); showToast('Copied'); return; }catch(e){}
+  // Clipboard API unavailable (e.g. not HTTPS) — select the text so it can be copied manually.
+  const el = document.getElementById(fallbackElId);
+  if (el){ const r = document.createRange(); r.selectNodeContents(el); const sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(r); }
+  showToast('Press Ctrl+C (or long-press) to copy');
+}
+function attachSheetKeyHandlers(){
+  document.querySelectorAll('[data-copy-sheet-key]').forEach(btn=>{
+    btn.onclick = () => copyText(btn.dataset.copySheetKey, 'sheet-key-value');
+  });
+  const showBtn = document.getElementById('sheet-key-show');
+  if (showBtn) showBtn.onclick = async () => {
+    try{ const r = await api('sheet-key.php'); mySheetKey = r.sheet_api_key; render(); }
+    catch(e){ showToast(e.message); }
+  };
+  const hideBtn = document.getElementById('sheet-key-hide');
+  if (hideBtn) hideBtn.onclick = () => { mySheetKey = null; render(); };
+
+  if (!sheetKeyView) return;
+  const close = () => { sheetKeyView = null; render(); };
+  document.getElementById('sheet-key-done').onclick = close;
+  document.getElementById('sheetkey-overlay').addEventListener('click', e=>{ if (e.target.id==='sheetkey-overlay') close(); });
+  document.getElementById('sheet-key-regenerate').onclick = async () => {
+    if (!confirm('Regenerate this store\'s Sheet API key?\n\nThe current key stops working immediately — their Google Sheet will stop syncing until the new key is pasted into its script.')) return;
+    try{
+      const r = await api('sheet-key.php', {method:'POST', body:{action:'regenerate', id: sheetKeyView.storeRowId}});
+      sheetKeyView = {...sheetKeyView, key: r.sheet_api_key, regenerated: true};
+      showToast('New key generated — the old one no longer works');
+      render();
+    }catch(e){ showToast(e.message); }
+  };
 }
 
 function topbar(){
@@ -770,6 +824,22 @@ function onceCredBox(){
     </div>
     </div></div>`;
 }
+function sheetKeyBox(){
+  const v = sheetKeyView;
+  return `
+    <div class="modal-overlay" id="sheetkey-overlay"><div class="modal">
+    <div class="once-box">
+      <div>${v.regenerated ? 'New Sheet API key' : 'Sheet API key'} for <b>${escapeHtml(v.label)}</b>:</div>
+      <div class="cred mono" id="sheet-key-value" style="word-break:break-all;">${escapeHtml(v.key)}</div>
+      <div class="warn">${v.regenerated ? 'The old key has stopped working — the store must paste this one into their Sheet\'s script.' : 'Share this only with the store. It is not their login password.'}</div>
+      <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;">
+        <button class="btn btn-sm" data-copy-sheet-key="${escapeHtml(v.key)}">Copy key</button>
+        <button class="btn btn-sm btn-outline" id="sheet-key-regenerate">Regenerate key</button>
+        <button class="btn btn-sm btn-outline" id="sheet-key-done">Done</button>
+      </div>
+    </div>
+    </div></div>`;
+}
 function resetPasswordModal(){
   const t = resetPwTarget;
   return `
@@ -815,7 +885,7 @@ function attachShellHandlers(){
       // plain left-click is intercepted to navigate instantly in-page.
       if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
       e.preventDefault();
-      activeSection = el.dataset.section; onceCred=null; selectedOrderIds=new Set(); selectedInvIds=new Set(); reportDrillDay=null; sidebarOpen=false; showMyTrash=false; editingExpenseId=null; sentReportViewId=null; sentReportSheet=null; window._invDrillStore=null; window._zoneDrill=null;
+      activeSection = el.dataset.section; onceCred=null; sheetKeyView=null; mySheetKey=null; selectedOrderIds=new Set(); selectedInvIds=new Set(); reportDrillDay=null; sidebarOpen=false; showMyTrash=false; editingExpenseId=null; sentReportViewId=null; sentReportSheet=null; window._invDrillStore=null; window._zoneDrill=null;
       render();
       try{
         if (activeSection === 'stores' && actor.type==='admin'){ await loadResetRequests('store'); render(); }
@@ -843,6 +913,7 @@ function attachShellHandlers(){
   attachTeamHandlers();
   attachWalletHandlers();
   attachStoresHandlers();
+  attachSheetKeyHandlers();
   attachAdminTeamHandlers();
   attachWithdrawalsHandlers();
   attachExpensesHandlers();
@@ -1952,6 +2023,7 @@ function storeAccordionRow(store){
         <div class="admin-main"><div class="item">${expanded?'▾':'▸'} ${escapeHtml(store.store_name)}</div><div class="sub">Store ID: <span class="mono" style="font-weight:800;color:var(--ink);">${escapeHtml(store.store_id)}</span> · ${team.length} team member${team.length===1?'':'s'}</div></div>
         <span class="badge badge-ok">store</span><div></div>
         <button class="admin-update-btn" data-reset-store="${store.id}" data-label="${escapeHtml(store.store_name)} (${escapeHtml(store.store_id)})">Reset password</button>
+        <button class="admin-update-btn" data-sheet-key-store="${store.id}" data-label="${escapeHtml(store.store_name)} (${escapeHtml(store.store_id)})">Sheet API key</button>
         <button class="admin-update-btn" data-remove-store="${store.id}">Remove</button>
       </div>
       ${expanded ? `<div style="padding-left:24px;background:var(--paper);">
@@ -1992,6 +2064,16 @@ function attachStoresHandlers(){
   });
   document.querySelectorAll('[data-reset-store]').forEach(btn=>{
     btn.onclick = () => { resetPwTarget = {kind:'store', id: parseInt(btn.dataset.resetStore,10), label: btn.dataset.label}; render(); };
+  });
+  document.querySelectorAll('[data-sheet-key-store]').forEach(btn=>{
+    btn.onclick = async () => {
+      const id = parseInt(btn.dataset.sheetKeyStore,10);
+      try{
+        const r = await api('sheet-key.php', {method:'POST', body:{action:'reveal', id}});
+        sheetKeyView = {label: btn.dataset.label, key: r.sheet_api_key, storeRowId: id, regenerated: false};
+        render();
+      }catch(e){ showToast(e.message); }
+    };
   });
   document.querySelectorAll('[data-toggle-store]').forEach(row=>{
     row.onclick = (e) => {
