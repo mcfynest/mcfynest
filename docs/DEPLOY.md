@@ -42,6 +42,11 @@ changes, you don't need to repeat the whole walkthrough below — just:
      (the Orders pill bug, money-blanking in reports, product renaming,
      order detail editing, expense editing, the sent-reports sheet)
      reuses columns that already exist as of migration 006.
+   - `sql/migration_008_sheet_import.sql` — Google Sheets order import:
+     adds `stores.sheet_api_key` (each store's Sheet API key, separate
+     from its login password) and the `sheet_import_log` table (one row
+     per request from a store's Sheet — check it, newest first, when a
+     store says their sheet isn't syncing).
 2. **Re-upload the changed files** from `public/` — safest is to
    re-upload the whole `public/` folder's contents again (File Manager
    → Extract a fresh zip over the old one, or FTP overwrite). Your own
@@ -80,7 +85,7 @@ That's it — steps 1–9 below are for a first-time install.
    `admin_accounts`, `products`, `agent_products`, `orders`.
 6. Repeat the same Import steps, in order, for each remaining file in
    `sql/`: `migration_002_v2_features.sql` through
-   `migration_007_v3_round5_fixes.sql`. On a brand-new database most of
+   `migration_008_sheet_import.sql`. On a brand-new database most of
    these have little or nothing to do (no data yet to migrate) — they're
    still required, since each one also adds the columns/tables that
    round of features needs.

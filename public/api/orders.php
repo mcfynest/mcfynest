@@ -1,6 +1,7 @@
 <?php
 declare(strict_types=1);
 require_once __DIR__ . '/../includes/bootstrap_api.php';
+require_once __DIR__ . '/../includes/orders_lib.php';
 
 $pdo = db();
 $actor = require_actor();
@@ -11,12 +12,6 @@ const ORDER_STATUSES = ['pending', 'scheduled', 'transit', 'delivered', 'remitte
 // forward to Remitted — reversing it back to an earlier status goes
 // through the dedicated 'undo' action instead, never a regular update.
 const POST_DELIVERED_ALLOWED_STATUSES = ['delivered', 'remitted'];
-// Statuses that still count against a product's reserved quantity —
-// i.e. the order hasn't reached a resolved end state yet. Delivered/
-// Remitted have already deducted physical stock (see stock_deducted
-// below) so they stop reserving; Cancelled/Returned never held stock
-// in the first place under this model, so they never reserved either.
-const RESERVING_STATUSES = ['pending', 'scheduled', 'transit', 'notpicking', 'issue'];
 
 /**
  * Physical stock is deducted exactly once, the moment an order first
@@ -166,66 +161,23 @@ if ($method === 'POST') {
     require_store_permission($pdo, $actor, 'order');
 
     $body = read_json_body();
-    $productId = (int) ($body['product_id'] ?? 0);
-    $customer = str_field($body, 'customer');
-    $phone = str_field($body, 'phone');
-    $altPhone = str_field($body, 'altPhone');
-    $dropoff = str_field($body, 'dropoff');
-    $zone = str_field($body, 'zone');
-    $notes = str_field($body, 'notes');
-    $amount = max(0, num_field($body, 'amount', 0));
-    $qty = max(1, (int) num_field($body, 'qty', 1));
-
-    if ($productId <= 0 || $customer === '' || $phone === '' || $dropoff === '') {
-        json_error('Fill in customer name, product, address and phone number.', 400);
-    }
-
-    $pdo->beginTransaction();
     try {
-        // Placing an order never touches physical stock — it only counts
-        // against the product's reserved quantity (see RESERVING_STATUSES).
-        // The row lock here is still what makes "available" a consistent
-        // read under concurrent order placement, same guarantee the old
-        // qty-decrement had; we just no longer mutate qty at this point.
-        $stmt = $pdo->prepare('SELECT id, name, qty FROM products WHERE id = ? AND store_id = ? AND deleted = 0 FOR UPDATE');
-        $stmt->execute([$productId, $actor['owner_row_id']]);
-        $product = $stmt->fetch();
-
-        if (!$product) {
-            $pdo->rollBack();
-            json_error('Product not found.', 404);
-        }
-
-        $placeholders = implode(',', array_fill(0, count(RESERVING_STATUSES), '?'));
-        $stmt = $pdo->prepare("SELECT COALESCE(SUM(qty), 0) FROM orders WHERE product_id = ? AND deleted = 0 AND status IN ($placeholders)");
-        $stmt->execute(array_merge([$productId], RESERVING_STATUSES));
-        $reserved = (int) $stmt->fetchColumn();
-        $available = max(0, (int) $product['qty'] - $reserved);
-
-        // Backorders are explicitly allowed — never blocked server-side.
-        // is_backorder is computed here (not trusted from the client) so
-        // the badge is always accurate regardless of what the client sent.
-        $isBackorder = $qty > $available;
-
-        $orderCode = generate_order_code($pdo);
-        $initialHistory = json_encode([['status' => 'pending', 'at' => date('Y-m-d H:i:s'), 'by' => $actor['store_name'] ?? '']]);
-        $stmt = $pdo->prepare('INSERT INTO orders
-            (order_code, store_id, placed_by_store_id, product_id, product_name, qty, customer_name, phone, alt_phone, delivery_address, zone, instructions, amount, is_backorder, status_history)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
-        $stmt->execute([
-            $orderCode, $actor['owner_row_id'], $actor['row_id'], $productId, $product['name'], $qty,
-            $customer, $phone, $altPhone ?: null, $dropoff, $zone ?: null, $notes, $amount, $isBackorder ? 1 : 0, $initialHistory,
+        $result = create_order($pdo, $actor['owner_row_id'], $actor['row_id'], $actor['store_name'] ?? '', [
+            'product_id' => (int) ($body['product_id'] ?? 0),
+            'customer' => str_field($body, 'customer'),
+            'phone' => str_field($body, 'phone'),
+            'alt_phone' => str_field($body, 'altPhone'),
+            'address' => str_field($body, 'dropoff'),
+            'zone' => str_field($body, 'zone'),
+            'notes' => str_field($body, 'notes'),
+            'amount' => $body['amount'] ?? null,
+            'qty' => $body['qty'] ?? 1,
         ]);
-
-        $pdo->commit();
-    } catch (Throwable $e) {
-        if ($pdo->inTransaction()) {
-            $pdo->rollBack();
-        }
-        throw $e;
+    } catch (OrderValidationException $e) {
+        json_error($e->getMessage(), $e->httpStatus);
     }
 
-    json_response(['order_code' => $orderCode, 'is_backorder' => $isBackorder], 201);
+    json_response(['order_code' => $result['order_code'], 'is_backorder' => $result['is_backorder']], 201);
 }
 
 if ($method === 'PATCH') {
